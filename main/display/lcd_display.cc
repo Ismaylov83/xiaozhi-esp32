@@ -17,8 +17,10 @@
 #include <vector>
 
 #include "board.h"
+#include "robot_eyes.h"
 
 #define TAG "LcdDisplay"
+static RobotEyes* s_robot_eyes = nullptr;  // ojos animados
 
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 LV_FONT_DECLARE(BUILTIN_ICON_FONT);
@@ -349,6 +351,11 @@ LcdDisplay::~LcdDisplay() {
     }
     if (emoji_box_ != nullptr) {
         lv_obj_del(emoji_box_);
+        // Ojos robot en lugar del emoji
+    lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+    s_robot_eyes = new RobotEyes(screen, width_, height_ * 55 / 100,
+                                 lv_color_to_u32(lvgl_theme->background_color()) & 0xFFFFFF);
+    lv_obj_align(s_robot_eyes->root(), LV_ALIGN_CENTER, 0, 0);
     }
     if (content_ != nullptr) {
         lv_obj_del(content_);
