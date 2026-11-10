@@ -19,9 +19,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git wget flex bison gperf python3 python3-pip python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0
 
-      - name: Configurar ESP-IDF v6.0.3
+      - name: Configurar ESP-IDF v6.0
         run: |
-          git clone -b release-v6.0.3 --depth 1 https://github.com/espressif/esp-idf.git $HOME/esp/esp-idf
+          git clone -b release-v6.0 --depth 1 https://github.com/espressif/esp-idf.git $HOME/esp/esp-idf
           cd $HOME/esp/esp-idf
           ./install.sh esp32s3
 
