@@ -9,17 +9,27 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Descargar código fuente con submódulos
+      - name: Descargar código con submódulos
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Compilar con ESP-IDF v5.3
-        uses: espressif/esp-idf-ci-action@v1
-        with:
-          esp_idf_version: v5.3
-          target: esp32s3
-          command: idf.py build
+      - name: Instalar dependencias del sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git wget flex bison gperf python3 python3-pip python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0
+
+      - name: Configurar ESP-IDF v5.3
+        run: |
+          git clone -b v5.3 --recursive https://github.com/espressif/esp-idf.git $HOME/esp/esp-idf
+          cd $HOME/esp/esp-idf
+          ./install.sh esp32s3
+
+      - name: Compilar Firmware
+        run: |
+          . $HOME/esp/esp-idf/export.sh
+          idf.py set-target esp32s3
+          idf.py build
 
       - name: Subir binario compilado (Artifact)
         uses: actions/upload-artifact@v4
