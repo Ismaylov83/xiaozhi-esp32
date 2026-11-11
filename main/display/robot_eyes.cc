@@ -1,4 +1,4 @@
-// robot_eyes.cc
+// robot_eyes.cc  (versión 2: con reacciones al tacto)
 #include "robot_eyes.h"
 
 #include <algorithm>
@@ -13,6 +13,18 @@ constexpr uint32_t kBlue = 0x4DA3FF;
 constexpr uint32_t kPink = 0xFF5FA2;
 
 constexpr int kTickMs = 33;  // ~30 fps
+
+// ---- Ajustes del tacto (puedes cambiarlos a tu gusto) ----
+constexpr uint32_t kTapMaxMs = 500;       // un toque más corto que esto es un "toque"
+constexpr uint32_t kDoubleTapMs = 450;    // segundo toque dentro de este tiempo = doble toque
+constexpr uint32_t kLongPressMs = 700;    // mantener esto = caricia
+constexpr uint32_t kSleepPressMs = 3000;  // mantener esto = sueño
+constexpr int kMovePx = 25;               // si el dedo se mueve más, ya no es toque ni pulsación
+constexpr uint32_t kTapReactMs = 900;     // duración de la sorpresa
+constexpr uint32_t kDoubleReactMs = 1600; // duración de la risa
+constexpr uint32_t kReleaseHoldMs = 500;  // tras soltar una caricia/sueño, tarda esto en volver
+constexpr float kTouchGazeX = 0.30f;      // cuánto se desplazan los ojos al seguir el dedo
+constexpr float kTouchGazeY = 0.25f;
 
 struct Named {
     const char* name;
@@ -44,13 +56,29 @@ const Named kTable[] = {
     {"sleepy",      {1.00f, 0.50f, 0.40f, 0.50f,  -8.f, 0.00f,  0.0f,  0.2f, kCyan, false}},
 };
 
+// Devuelve la expresión por nombre; si no existe, "neutral".
+const RobotEyes::Pose& Lookup(const char* name) {
+    if (name) {
+        for (const auto& n : kTable) {
+            if (std::strcmp(n.name, name) == 0) {
+                return n.pose;
+            }
+        }
+    }
+    return kTable[0].pose;
+}
+
 inline bool Due(uint32_t now, uint32_t t) {
     return static_cast<int32_t>(now - t) >= 0;
 }
 
-// Rango aleatorio con signo en [-1, 1]
+// Número aleatorio con signo en [-1, 1]
 inline float RandSigned() {
     return (static_cast<int>(lv_rand(0, 200)) - 100) / 100.0f;
+}
+
+inline float Clamp1(float v) {
+    return std::max(-1.0f, std::min(1.0f, v));
 }
 
 lv_obj_t* MakeBlock(lv_obj_t* parent, uint32_t color) {
@@ -91,7 +119,7 @@ RobotEyes::RobotEyes(lv_obj_t* parent, int width, int height, uint32_t bg_color)
         lv_obj_set_style_radius(e.lid_bottom, LV_RADIUS_CIRCLE, 0);
     }
 
-    cur_ = target_ = kTable[0].pose;
+    base_ = cur_ = target_ = react_pose_ = kTable[0].pose;
     color_ = lv_color_hex(cur_.color);
 
     const uint32_t now = lv_tick_get();
@@ -114,28 +142,115 @@ RobotEyes::~RobotEyes() {
 }
 
 void RobotEyes::SetEmotion(const char* emotion) {
-    const Pose* found = &kTable[0].pose;
-    if (emotion) {
-        for (const auto& n : kTable) {
-            if (std::strcmp(n.name, emotion) == 0) {
-                found = &n.pose;
-                break;
-            }
-        }
-    }
-    target_ = *found;
+    base_ = Lookup(emotion);
 
     // Un parpadeo rápido al cambiar de expresión queda más natural.
     blinking_ = true;
     blink_end_ = lv_tick_get() + 110;
 }
 
+void RobotEyes::StartReaction(const char* name, uint32_t ms) {
+    react_pose_ = Lookup(name);
+    react_active_ = true;
+    react_hold_ = (ms == 0);
+    react_until_ = lv_tick_get() + ms;
+}
+
 void RobotEyes::TimerCb(lv_timer_t* t) {
     static_cast<RobotEyes*>(lv_timer_get_user_data(t))->Tick();
 }
 
+void RobotEyes::PollTouch(uint32_t now) {
+    // Buscar el dispositivo táctil (puntero) de LVGL
+    if (indev_ == nullptr) {
+        for (lv_indev_t* i = lv_indev_get_next(nullptr); i != nullptr; i = lv_indev_get_next(i)) {
+            if (lv_indev_get_type(i) == LV_INDEV_TYPE_POINTER) {
+                indev_ = i;
+                break;
+            }
+        }
+    }
+    if (indev_ == nullptr) {
+        return;
+    }
+
+    const bool pressed = (lv_indev_get_state(indev_) == LV_INDEV_STATE_PRESSED);
+    lv_point_t p = {0, 0};
+    if (pressed) {
+        lv_indev_get_point(indev_, &p);
+    }
+
+    lv_display_t* disp = lv_display_get_default();
+    const float hres = disp ? static_cast<float>(lv_display_get_horizontal_resolution(disp)) : static_cast<float>(width_);
+    const float vres = disp ? static_cast<float>(lv_display_get_vertical_resolution(disp)) : static_cast<float>(height_);
+
+    // Dedo recién puesto
+    if (pressed && !was_pressed_) {
+        press_start_ = now;
+        press_x_ = p.x;
+        press_y_ = p.y;
+        moved_ = false;
+        hold_stage_ = 0;
+    }
+
+    if (pressed) {
+        touching_ = true;
+
+        // Los ojos miran hacia donde está el dedo
+        touch_tx_ = Clamp1((p.x - hres * 0.5f) / (hres * 0.5f));
+        touch_ty_ = Clamp1((p.y - vres * 0.5f) / (vres * 0.5f));
+
+        // ¿Se está arrastrando?
+        const int dx = p.x - press_x_;
+        const int dy = p.y - press_y_;
+        if (dx * dx + dy * dy > kMovePx * kMovePx) {
+            moved_ = true;
+        }
+
+        // Pulsaciones largas (solo si el dedo está quieto)
+        if (!moved_) {
+            const uint32_t held = now - press_start_;
+            if (held >= kSleepPressMs && hold_stage_ < 2) {
+                StartReaction("sleepy", 0);
+                hold_stage_ = 2;
+            } else if (held >= kLongPressMs && hold_stage_ < 1) {
+                StartReaction("loving", 0);
+                hold_stage_ = 1;
+            }
+        }
+    } else {
+        touching_ = false;
+        touch_tx_ = 0.0f;
+        touch_ty_ = 0.0f;
+    }
+
+    // Dedo recién levantado
+    if (!pressed && was_pressed_) {
+        const uint32_t held = now - press_start_;
+        if (hold_stage_ > 0) {
+            // Caricia o sueño: se mantiene un momento y vuelve
+            react_hold_ = false;
+            react_until_ = now + kReleaseHoldMs;
+        } else if (!moved_ && held < kTapMaxMs) {
+            const bool dbl = tapped_before_ && (now - last_tap_) < kDoubleTapMs;
+            last_tap_ = now;
+            tapped_before_ = true;
+            if (dbl) {
+                StartReaction("laughing", kDoubleReactMs);
+            } else {
+                StartReaction("surprised", kTapReactMs);
+            }
+        }
+    }
+
+    was_pressed_ = pressed;
+}
+
 void RobotEyes::Tick() {
     const uint32_t now = lv_tick_get();
+
+    // --- Tacto ---
+    PollTouch(now);
 
     // --- Parpadeo aleatorio ---
     if (!blinking_ && Due(now, next_blink_)) {
@@ -154,6 +269,12 @@ void RobotEyes::Tick() {
         next_gaze_ = now + lv_rand(1200, 3500);
     }
 
+    // --- ¿Reacción al tacto activa? ---
+    if (react_active_ && !react_hold_ && Due(now, react_until_)) {
+        react_active_ = false;
+    }
+    target_ = react_active_ ? react_pose_ : base_;
+
     // --- Suavizado hacia la expresión objetivo ---
     constexpr float k = 0.22f;
     auto ease = [](float& c, float t, float kk) { c += (t - c) * kk; };
@@ -167,6 +288,9 @@ void RobotEyes::Tick() {
     ease(cur_.gaze_y, target_.gaze_y, k);
     ease(blink_k_, blinking_ ? 0.06f : 1.0f, 0.6f);
     ease(wink_k_, target_.wink ? 0.08f : 1.0f, 0.35f);
+    ease(touch_gx_, touch_tx_, 0.35f);
+    ease(touch_gy_, touch_ty_, 0.35f);
+    ease(touch_w_, touching_ ? 1.0f : 0.0f, 0.25f);
     color_ = lv_color_mix(lv_color_hex(target_.color), color_, 70);
 
     Apply();
@@ -180,6 +304,11 @@ void RobotEyes::Apply() {
     const float w = std::max(base_w * cur_.w, 4.0f);
     const float h_open = base_h * cur_.h;
 
+    // Mirada total = mirada de la expresión + mirada errante (si no hay dedo) + mirada hacia el dedo
+    const float idle_k = 1.0f - touch_w_;
+    const float gx = (cur_.gaze_x * 0.12f + idle_x_ * idle_k) * base_w + touch_gx_ * kTouchGazeX * base_w;
+    const float gy = (cur_.gaze_y * 0.12f + idle_y_ * idle_k) * base_h + touch_gy_ * kTouchGazeY * base_h;
+
     for (int i = 0; i < 2; ++i) {
         const bool right = (i == 1);
         Eye& e = eyes_[i];
@@ -189,8 +318,6 @@ void RobotEyes::Apply() {
         const float hh = std::max(h_open * k, 3.0f);
 
         // Posición: centro del área +/- mitad del ojo y del hueco, más la mirada.
-        const float gx = (cur_.gaze_x * 0.12f + idle_x_) * base_w;
-        const float gy = (cur_.gaze_y * 0.12f + idle_y_) * base_h;
         const float cx = width_ / 2.0f + (right ? 1.0f : -1.0f) * (w / 2.0f + gap / 2.0f);
         const float x = cx - w / 2.0f + gx;
         const float y = height_ / 2.0f - hh / 2.0f + gy;
