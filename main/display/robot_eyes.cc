@@ -1,16 +1,25 @@
-// robot_eyes.cc  (versión 2: con reacciones al tacto)
+// robot_eyes.cc  (versión 3: tacto + inclinación + sacudida)
 #include "robot_eyes.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 
+#include <driver/i2c_master.h>
+#include <esp_log.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
 namespace {
+
+const char* TAG = "RobotEyes";
 
 constexpr uint32_t kCyan = 0x00E5FF;
 constexpr uint32_t kRed = 0xFF3B30;
 constexpr uint32_t kBlue = 0x4DA3FF;
 constexpr uint32_t kPink = 0xFF5FA2;
+constexpr uint32_t kAmber = 0xFFD23C;
 
 constexpr int kTickMs = 33;  // ~30 fps
 
@@ -26,6 +35,20 @@ constexpr uint32_t kReleaseHoldMs = 500;  // tras soltar una caricia/sueño, tar
 constexpr float kTouchGazeX = 0.30f;      // cuánto se desplazan los ojos al seguir el dedo
 constexpr float kTouchGazeY = 0.25f;
 
+// ---- Ajustes del sensor de movimiento ----
+// Si al inclinar a la DERECHA los ojos miran a la IZQUIERDA, cambia 1.0f por -1.0f.
+constexpr float kTiltSign = 1.0f;
+// Si inclinar a los lados no hace nada pero inclinar hacia delante/atrás sí, pon true.
+constexpr bool kTiltUseY = false;
+constexpr float kTiltFullG = 0.5f;        // inclinación (en g) con la que los ojos miran al máximo
+constexpr float kTiltDeadG = 0.08f;       // por debajo de esto se considera "recto"
+constexpr float kTiltGazeX = 0.30f;       // cuánto se desplazan los ojos al inclinar
+constexpr float kShakeThresholdG = 0.8f;  // fuerza mínima de un "golpe" de la sacudida
+constexpr int kShakeSpikes = 4;           // golpes necesarios...
+constexpr uint32_t kShakeWindowMs = 900;  // ...dentro de este tiempo
+constexpr uint32_t kShakeCooldownMs = 3000;  // pausa mínima entre sacudidas detectadas
+constexpr uint32_t kShakeDurationMs = 2500;  // cuánto dura el mareo
+
 struct Named {
     const char* name;
     RobotEyes::Pose pose;
@@ -33,27 +56,28 @@ struct Named {
 
 //                          w     h    radius lidT  angle lidB  gx    gy    color  wink
 const Named kTable[] = {
-    {"neutral",     {1.00f, 1.00f, 0.35f, 0.00f,   0.f, 0.00f,  0.0f,  0.0f, kCyan, false}},
-    {"happy",       {1.00f, 0.85f, 0.50f, 0.00f,   0.f, 0.45f,  0.0f,  0.0f, kCyan, false}},
-    {"laughing",    {1.05f, 0.70f, 0.50f, 0.00f,   0.f, 0.60f,  0.0f,  0.0f, kCyan, false}},
-    {"funny",       {1.05f, 0.70f, 0.50f, 0.00f,   0.f, 0.60f,  0.0f,  0.0f, kCyan, false}},
-    {"silly",       {1.05f, 0.70f, 0.50f, 0.00f,   0.f, 0.60f,  0.0f,  0.0f, kCyan, false}},
-    {"sad",         {1.00f, 1.00f, 0.40f, 0.35f, -18.f, 0.00f,  0.0f,  0.1f, kBlue, false}},
-    {"crying",      {1.00f, 0.90f, 0.45f, 0.35f, -20.f, 0.00f,  0.0f,  0.2f, kBlue, false}},
-    {"angry",       {1.00f, 0.95f, 0.20f, 0.45f,  20.f, 0.00f,  0.0f,  0.0f, kRed,  false}},
-    {"loving",      {1.00f, 0.85f, 0.50f, 0.00f,   0.f, 0.40f,  0.0f,  0.0f, kPink, false}},
-    {"kissy",       {1.00f, 0.85f, 0.50f, 0.00f,   0.f, 0.40f,  0.0f,  0.0f, kPink, false}},
-    {"embarrassed", {0.95f, 0.75f, 0.50f, 0.10f,   0.f, 0.30f,  0.0f,  0.3f, kPink, false}},
-    {"surprised",   {0.80f, 1.30f, 0.50f, 0.00f,   0.f, 0.00f,  0.0f,  0.0f, kCyan, false}},
-    {"shocked",     {0.70f, 1.40f, 0.50f, 0.00f,   0.f, 0.00f,  0.0f,  0.0f, kCyan, false}},
-    {"thinking",    {0.90f, 0.90f, 0.35f, 0.25f,   6.f, 0.00f,  0.6f, -0.6f, kCyan, false}},
-    {"confused",    {0.95f, 1.00f, 0.40f, 0.15f,  -6.f, 0.00f, -0.6f,  0.3f, kCyan, false}},
-    {"winking",     {1.00f, 1.00f, 0.35f, 0.00f,   0.f, 0.00f,  0.0f,  0.0f, kCyan, true }},
-    {"cool",        {1.10f, 0.55f, 0.20f, 0.25f,   0.f, 0.00f,  0.0f,  0.0f, kCyan, false}},
-    {"relaxed",     {1.00f, 0.60f, 0.50f, 0.30f,   0.f, 0.20f,  0.0f,  0.0f, kCyan, false}},
-    {"delicious",   {1.00f, 0.85f, 0.50f, 0.00f,   0.f, 0.45f,  0.0f,  0.0f, kCyan, false}},
-    {"confident",   {1.00f, 0.85f, 0.30f, 0.30f,   8.f, 0.00f,  0.0f,  0.0f, kCyan, false}},
-    {"sleepy",      {1.00f, 0.50f, 0.40f, 0.50f,  -8.f, 0.00f,  0.0f,  0.2f, kCyan, false}},
+    {"neutral",     {1.00f, 1.00f, 0.35f, 0.00f,   0.f, 0.00f,  0.0f,  0.0f, kCyan,  false}},
+    {"happy",       {1.00f, 0.85f, 0.50f, 0.00f,   0.f, 0.45f,  0.0f,  0.0f, kCyan,  false}},
+    {"laughing",    {1.05f, 0.70f, 0.50f, 0.00f,   0.f, 0.60f,  0.0f,  0.0f, kCyan,  false}},
+    {"funny",       {1.05f, 0.70f, 0.50f, 0.00f,   0.f, 0.60f,  0.0f,  0.0f, kCyan,  false}},
+    {"silly",       {1.05f, 0.70f, 0.50f, 0.00f,   0.f, 0.60f,  0.0f,  0.0f, kCyan,  false}},
+    {"sad",         {1.00f, 1.00f, 0.40f, 0.35f, -18.f, 0.00f,  0.0f,  0.1f, kBlue,  false}},
+    {"crying",      {1.00f, 0.90f, 0.45f, 0.35f, -20.f, 0.00f,  0.0f,  0.2f, kBlue,  false}},
+    {"angry",       {1.00f, 0.95f, 0.20f, 0.45f,  20.f, 0.00f,  0.0f,  0.0f, kRed,   false}},
+    {"loving",      {1.00f, 0.85f, 0.50f, 0.00f,   0.f, 0.40f,  0.0f,  0.0f, kPink,  false}},
+    {"kissy",       {1.00f, 0.85f, 0.50f, 0.00f,   0.f, 0.40f,  0.0f,  0.0f, kPink,  false}},
+    {"embarrassed", {0.95f, 0.75f, 0.50f, 0.10f,   0.f, 0.30f,  0.0f,  0.3f, kPink,  false}},
+    {"surprised",   {0.80f, 1.30f, 0.50f, 0.00f,   0.f, 0.00f,  0.0f,  0.0f, kCyan,  false}},
+    {"shocked",     {0.70f, 1.40f, 0.50f, 0.00f,   0.f, 0.00f,  0.0f,  0.0f, kCyan,  false}},
+    {"thinking",    {0.90f, 0.90f, 0.35f, 0.25f,   6.f, 0.00f,  0.6f, -0.6f, kCyan,  false}},
+    {"confused",    {0.95f, 1.00f, 0.40f, 0.15f,  -6.f, 0.00f, -0.6f,  0.3f, kCyan,  false}},
+    {"winking",     {1.00f, 1.00f, 0.35f, 0.00f,   0.f, 0.00f,  0.0f,  0.0f, kCyan,  true }},
+    {"cool",        {1.10f, 0.55f, 0.20f, 0.25f,   0.f, 0.00f,  0.0f,  0.0f, kCyan,  false}},
+    {"relaxed",     {1.00f, 0.60f, 0.50f, 0.30f,   0.f, 0.20f,  0.0f,  0.0f, kCyan,  false}},
+    {"delicious",   {1.00f, 0.85f, 0.50f, 0.00f,   0.f, 0.45f,  0.0f,  0.0f, kCyan,  false}},
+    {"confident",   {1.00f, 0.85f, 0.30f, 0.30f,   8.f, 0.00f,  0.0f,  0.0f, kCyan,  false}},
+    {"sleepy",      {1.00f, 0.50f, 0.40f, 0.50f,  -8.f, 0.00f,  0.0f,  0.2f, kCyan,  false}},
+    {"dizzy",       {1.00f, 0.90f, 0.50f, 0.10f,   0.f, 0.00f,  0.0f,  0.0f, kAmber, false}},
 };
 
 // Devuelve la expresión por nombre; si no existe, "neutral".
@@ -128,9 +152,20 @@ RobotEyes::RobotEyes(lv_obj_t* parent, int width, int height, uint32_t bg_color)
 
     Apply();
     timer_ = lv_timer_create(TimerCb, kTickMs, this);
+
+    // Tarea que lee el sensor de movimiento
+    imu_running_ = true;
+    if (xTaskCreate(ImuTask, "eyes_imu", 4096, this, 2, nullptr) != pdPASS) {
+        imu_running_ = false;
+        ESP_LOGW(TAG, "No se pudo crear la tarea del sensor de movimiento");
+    }
 }
 
 RobotEyes::~RobotEyes() {
+    imu_stop_ = true;
+    for (int i = 0; i < 25 && imu_running_; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
     if (timer_) {
         lv_timer_delete(timer_);
         timer_ = nullptr;
@@ -158,6 +193,124 @@ void RobotEyes::StartReaction(const char* name, uint32_t ms) {
 
 void RobotEyes::TimerCb(lv_timer_t* t) {
     static_cast<RobotEyes*>(lv_timer_get_user_data(t))->Tick();
+}
+
+void RobotEyes::ImuTask(void* arg) {
+    RobotEyes* self = static_cast<RobotEyes*>(arg);
+    self->ImuLoop();
+    self->imu_running_ = false;
+    vTaskDelete(nullptr);
+}
+
+// Lee el acelerómetro QMI8658 (mismo bus I2C que usa el resto de la placa).
+void RobotEyes::ImuLoop() {
+    // Esperar a que arranque el resto de la placa
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    i2c_master_bus_handle_t bus = nullptr;
+    if (i2c_master_get_bus_handle(I2C_NUM_0, &bus) != ESP_OK || bus == nullptr) {
+        ESP_LOGW(TAG, "No se encontró el bus I2C del sensor");
+        imu_status_ = 2;
+        return;
+    }
+
+    // El QMI8658 puede estar en 0x6B o 0x6A
+    uint8_t addr = 0;
+    const uint8_t candidates[] = {0x6B, 0x6A};
+    for (uint8_t a : candidates) {
+        if (i2c_master_probe(bus, a, 50) == ESP_OK) {
+            addr = a;
+            break;
+        }
+    }
+    if (addr == 0) {
+        ESP_LOGW(TAG, "QMI8658 no responde en 0x6B ni 0x6A");
+        imu_status_ = 2;
+        return;
+    }
+
+    i2c_device_config_t cfg = {};
+    cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    cfg.device_address = addr;
+    cfg.scl_speed_hz = 400000;
+    i2c_master_dev_handle_t dev = nullptr;
+    if (i2c_master_bus_add_device(bus, &cfg, &dev) != ESP_OK || dev == nullptr) {
+        ESP_LOGW(TAG, "No se pudo añadir el QMI8658 al bus");
+        imu_status_ = 2;
+        return;
+    }
+
+    // Comprobar identidad (WHO_AM_I = 0x05)
+    uint8_t reg = 0x00;
+    uint8_t id = 0;
+    if (i2c_master_transmit_receive(dev, &reg, 1, &id, 1, 100) != ESP_OK || id != 0x05) {
+        ESP_LOGW(TAG, "El chip en 0x%02X no es un QMI8658 (id=0x%02X)", addr, id);
+        i2c_master_bus_rm_device(dev);
+        imu_status_ = 2;
+        return;
+    }
+
+    auto write_reg = [&](uint8_t r, uint8_t v) {
+        uint8_t b[2] = {r, v};
+        return i2c_master_transmit(dev, b, 2, 100);
+    };
+    write_reg(0x02, 0x40);  // CTRL1: autoincremento de dirección
+    write_reg(0x03, 0x16);  // CTRL2: acelerómetro +-4 g, 125 Hz
+    write_reg(0x08, 0x01);  // CTRL7: acelerómetro activado
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    ESP_LOGI(TAG, "QMI8658 listo en 0x%02X", addr);
+    imu_status_ = 1;
+
+    constexpr float kLsbPerG = 8192.0f;  // +-4 g
+    float tilt_f = 0.0f;
+    int spikes = 0;
+    int64_t first_spike = 0;
+    int64_t last_spike = 0;
+    int64_t last_shake = -100000;
+
+    while (!imu_stop_) {
+        uint8_t r = 0x35;  // AX_L ... AZ_H
+        uint8_t d[6] = {};
+        if (i2c_master_transmit_receive(dev, &r, 1, d, 6, 50) == ESP_OK) {
+            const int16_t rx = static_cast<int16_t>(d[0] | (d[1] << 8));
+            const int16_t ry = static_cast<int16_t>(d[2] | (d[3] << 8));
+            const int16_t rz = static_cast<int16_t>(d[4] | (d[5] << 8));
+            const float ax = rx / kLsbPerG;
+            const float ay = ry / kLsbPerG;
+            const float az = rz / kLsbPerG;
+
+            // --- Inclinación lateral ---
+            float t = (kTiltUseY ? ay : ax) * kTiltSign;
+            if (std::fabs(t) < kTiltDeadG) {
+                t = 0.0f;
+            }
+            tilt_f = tilt_f * 0.8f + t * 0.2f;
+            tilt_in_ = Clamp1(tilt_f / kTiltFullG);
+
+            // --- Sacudida: varios golpes fuertes seguidos ---
+            const int64_t now_ms = esp_timer_get_time() / 1000;
+            const float m = std::sqrt(ax * ax + ay * ay + az * az);
+            if (spikes > 0 && now_ms - first_spike > static_cast<int64_t>(kShakeWindowMs)) {
+                spikes = 0;
+            }
+            if (std::fabs(m - 1.0f) > kShakeThresholdG && now_ms - last_spike >= 60) {
+                if (spikes == 0) {
+                    first_spike = now_ms;
+                }
+                spikes++;
+                last_spike = now_ms;
+                if (spikes >= kShakeSpikes && now_ms - last_shake >= static_cast<int64_t>(kShakeCooldownMs)) {
+                    shake_req_ = true;
+                    last_shake = now_ms;
+                    spikes = 0;
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    i2c_master_bus_rm_device(dev);
 }
 
 void RobotEyes::PollTouch(uint32_t now) {
@@ -252,6 +405,32 @@ void RobotEyes::Tick() {
     // --- Tacto ---
     PollTouch(now);
 
+    // --- Sensor de movimiento ---
+    const int st = imu_status_.exchange(0);
+    if (st == 1) {
+        StartReaction("winking", 1200);  // guiño: el sensor funciona
+    } else if (st == 2) {
+        StartReaction("sad", 1500);      // cara triste: no se encontró el sensor
+    }
+    if (shake_req_.exchange(false)) {
+        shaking_ = true;
+        shake_start_ = now;
+        shake_until_ = now + kShakeDurationMs;
+        StartReaction("dizzy", kShakeDurationMs);
+    }
+    if (shaking_) {
+        const float t = (now - shake_start_) / 1000.0f;
+        const float remain = static_cast<int32_t>(shake_until_ - now) / 1000.0f;
+        const float amp = remain > 0.7f ? 1.0f : std::max(0.0f, remain / 0.7f);
+        shake_tx_ = std::cos(t * 9.0f) * amp;
+        shake_ty_ = std::sin(t * 9.0f) * amp * 0.7f;
+        if (Due(now, shake_until_)) {
+            shaking_ = false;
+            shake_tx_ = 0.0f;
+            shake_ty_ = 0.0f;
+        }
+    }
+
     // --- Parpadeo aleatorio ---
     if (!blinking_ && Due(now, next_blink_)) {
         blinking_ = true;
@@ -269,7 +448,7 @@ void RobotEyes::Tick() {
         next_gaze_ = now + lv_rand(1200, 3500);
     }
 
-    // --- ¿Reacción al tacto activa? ---
+    // --- ¿Reacción activa? ---
     if (react_active_ && !react_hold_ && Due(now, react_until_)) {
         react_active_ = false;
     }
@@ -291,6 +470,9 @@ void RobotEyes::Tick() {
     ease(touch_gx_, touch_tx_, 0.35f);
     ease(touch_gy_, touch_ty_, 0.35f);
     ease(touch_w_, touching_ ? 1.0f : 0.0f, 0.25f);
+    ease(tilt_gx_, tilt_in_.load(), 0.2f);
+    ease(shake_gx_, shake_tx_, 0.5f);
+    ease(shake_gy_, shake_ty_, 0.5f);
     color_ = lv_color_mix(lv_color_hex(target_.color), color_, 70);
 
     Apply();
@@ -304,10 +486,20 @@ void RobotEyes::Apply() {
     const float w = std::max(base_w * cur_.w, 4.0f);
     const float h_open = base_h * cur_.h;
 
-    // Mirada total = mirada de la expresión + mirada errante (si no hay dedo) + mirada hacia el dedo
-    const float idle_k = 1.0f - touch_w_;
-    const float gx = (cur_.gaze_x * 0.12f + idle_x_ * idle_k) * base_w + touch_gx_ * kTouchGazeX * base_w;
-    const float gy = (cur_.gaze_y * 0.12f + idle_y_ * idle_k) * base_h + touch_gy_ * kTouchGazeY * base_h;
+    // La mirada errante se apaga cuando hay dedo, inclinación o mareo
+    float idle_k = (1.0f - touch_w_) * (1.0f - std::min(1.0f, std::fabs(tilt_gx_)));
+    if (shaking_) {
+        idle_k = 0.0f;
+    }
+    const float tilt_w = 1.0f - touch_w_;  // el dedo manda sobre la inclinación
+
+    const float gx = (cur_.gaze_x * 0.12f + idle_x_ * idle_k) * base_w
+                     + touch_gx_ * kTouchGazeX * base_w
+                     + tilt_gx_ * kTiltGazeX * base_w * tilt_w
+                     + shake_gx_ * 0.35f * base_w;
+    const float gy = (cur_.gaze_y * 0.12f + idle_y_ * idle_k) * base_h
+                     + touch_gy_ * kTouchGazeY * base_h
+                     + shake_gy_ * 0.25f * base_h;
 
     for (int i = 0; i < 2; ++i) {
         const bool right = (i == 1);
