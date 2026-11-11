@@ -1,6 +1,14 @@
-// robot_eyes.h
+// robot_eyes.h  (versión 2: con reacciones al tacto)
 // Ojos animados estilo robot para LVGL 9 (pensado para xiaozhi-esp32).
 // Dibujados solo con objetos LVGL: sin imágenes, sin GIFs, casi sin RAM.
+//
+// Tacto (se lee directamente del dispositivo táctil de LVGL, no hace falta
+// tocar nada más en el código de la placa):
+//   - dedo sobre la pantalla  -> los ojos siguen el dedo con la mirada
+//   - toque corto             -> sorpresa
+//   - doble toque             -> risa
+//   - mantener ~0,7 s         -> caricia (ojos cariñosos)
+//   - mantener ~3 s           -> sueño
 #pragma once
 
 #include <lvgl.h>
@@ -46,6 +54,9 @@ private:
     static void TimerCb(lv_timer_t* t);
     void Tick();
     void Apply();
+    void PollTouch(uint32_t now);
+    // ms = 0: la reacción dura mientras se mantenga el dedo
+    void StartReaction(const char* name, uint32_t ms);
 
     int width_;
     int height_;
@@ -54,8 +65,9 @@ private:
     Eye eyes_[2] = {};
     lv_timer_t* timer_ = nullptr;
 
-    Pose cur_{};
-    Pose target_{};
+    Pose base_{};    // expresión que pide xiaozhi
+    Pose cur_{};     // expresión que se está dibujando ahora
+    Pose target_{};  // hacia la que se mueve (base o reacción al tacto)
     lv_color_t color_{};
 
     float blink_k_ = 1.0f;
@@ -66,4 +78,27 @@ private:
     uint32_t next_blink_ = 0;
     uint32_t blink_end_ = 0;
     uint32_t next_gaze_ = 0;
+
+    // Reacción temporal al tacto
+    bool react_active_ = false;
+    bool react_hold_ = false;
+    Pose react_pose_{};
+    uint32_t react_until_ = 0;
+
+    // Estado del tacto
+    lv_indev_t* indev_ = nullptr;
+    bool was_pressed_ = false;
+    bool moved_ = false;
+    bool touching_ = false;
+    bool tapped_before_ = false;
+    int press_x_ = 0;
+    int press_y_ = 0;
+    int hold_stage_ = 0;  // 0 = nada, 1 = caricia, 2 = sueño
+    uint32_t press_start_ = 0;
+    uint32_t last_tap_ = 0;
+    float touch_tx_ = 0.0f;  // objetivo de mirada por tacto (-1..1)
+    float touch_ty_ = 0.0f;
+    float touch_gx_ = 0.0f;  // valor suavizado
+    float touch_gy_ = 0.0f;
+    float touch_w_ = 0.0f;   // 0..1: cuánto manda el dedo sobre la mirada
 };
