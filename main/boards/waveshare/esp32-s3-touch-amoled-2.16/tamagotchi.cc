@@ -8,6 +8,7 @@
 #include <nvs_flash.h>
 
 #include <algorithm>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -79,6 +80,18 @@ struct BtnDef {
 const BtnDef kBtns[kBtnCount] = {
     {"COME", 0xFF9F43}, {"JUEGO", 0x54A0FF}, {"LUZ", 0xFECA57},
     {"MEDI", 0xFF6B6B}, {"LIMP", 0x1DD1A1},  {"DISC", 0xA29BFE},
+};
+
+struct SkyInfo {
+    uint32_t top, bottom, ground, body;
+};
+
+// 0 noche, 1 amanecer, 2 dia, 3 atardecer
+const SkyInfo kSky[4] = {
+    {0x0B1026, 0x1B2A55, 0x1B3A2A, 0xF4F1D0},
+    {0x5B5BA8, 0xFFB48A, 0x4C8A4C, 0xFFE08A},
+    {0x3A8DDE, 0x9AD1F5, 0x3F9E4D, 0xFFD93D},
+    {0x3B2A6B, 0xFF7A4D, 0x3E6E3E, 0xFF9F43},
 };
 
 uint32_t Rnd(uint32_t n) { return esp_random() % n; }
@@ -999,6 +1012,20 @@ void Tamagotchi::BuildUI() {
     lv_obj_add_flag(root_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(root_, OnRootClick, LV_EVENT_CLICKED, nullptr);
 
+    // Fondo: cielo, estrellas, sol/luna y suelo (cambian con la hora)
+    sky_ = Box(root_, 0, 0, kW, kH, C(0x3A8DDE), 0);
+    lv_obj_set_style_bg_grad_dir(sky_, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_grad_color(sky_, C(0x9AD1F5), 0);
+    const int sx[10] = {60, 120, 190, 250, 310, 370, 420, 90, 340, 220};
+    const int sy[10] = {120, 90, 140, 110, 100, 150, 130, 170, 180, 70};
+    for (int i = 0; i < 10; i++) {
+        stars_[i] = Circle(root_, sx[i], sy[i], 4, C(0xFFFFFF));
+        Show(stars_[i], false);
+    }
+    body_ = Circle(root_, 30, 100, 44, C(0xFFD93D));
+    ground_ = Box(root_, 0, 330, kW, 150, C(0x3F9E4D), 0);
+    bg_key_ = -1;
+
     // Corazones
     MakeLabel(root_, "HAMBRE", 0xFF9F43, LV_ALIGN_TOP_LEFT, 70, 14);
     MakeLabel(root_, "FELIZ", 0xFF5C8D, LV_ALIGN_TOP_LEFT, 290, 14);
@@ -1008,7 +1035,7 @@ void Tamagotchi::BuildUI() {
     }
 
     name_lbl_ = MakeLabel(root_, "", 0xFFFFFF, LV_ALIGN_TOP_MID, 0, 60, 380);
-    stats_lbl_ = MakeLabel(root_, "", 0xBBBBBB, LV_ALIGN_TOP_MID, 0, 80, 380);
+    stats_lbl_ = MakeLabel(root_, "", 0xEEEEEE, LV_ALIGN_TOP_MID, 0, 80, 380);
 
     // Zona de la mascota
     cont_ = Box(root_, kContX, kContY, kContW, kContH, C(0x000000), 0);
@@ -1023,13 +1050,15 @@ void Tamagotchi::BuildUI() {
         Show(poop_[i][1], false);
     }
 
-    dark_ = Box(root_, 0, 92, kW, 300, C(0x000000), 0);
+    dark_ = Box(root_, 0, 0, kW, 396, C(0x000000), 0);
     lv_obj_set_style_bg_opa(dark_, LV_OPA_80, 0);
     Show(dark_, false);
 
     zzz_ = MakeLabel(root_, "Z z z", 0x9DB4FF, LV_ALIGN_TOP_MID, 100, 110);
     Show(zzz_, false);
 
+    lv_obj_t* msg_bg = Box(root_, 30, 346, 420, 44, C(0x000000), 12);
+    lv_obj_set_style_bg_opa(msg_bg, LV_OPA_40, 0);
     msg_lbl_ = MakeLabel(root_, "", 0xFFE066, LV_ALIGN_TOP_MID, 0, 350, 380);
 
     // Menu de comida
@@ -1325,8 +1354,51 @@ void Tamagotchi::UpdateFace() {
     lv_obj_set_pos(mouth_, face_cx_ - w / 2, mouth_y_ + dy);
 }
 
+void Tamagotchi::UpdateBackground() {
+    if (!sky_) return;
+
+    int phase = 2;  // dia mientras no haya hora
+    float h = 12.0f;
+    bool valid = false;
+    const time_t now = time(nullptr);
+    if (now >= 1700000000) {
+        struct tm t;
+        localtime_r(&now, &t);
+        h = t.tm_hour + t.tm_min / 60.0f;
+        valid = true;
+    }
+    const bool night_forced = st_.alive && st_.asleep;  // dormido = siempre noche
+    if (night_forced) {
+        phase = 0;
+    } else if (valid) {
+        phase = (h < 6.0f || h >= 21.0f) ? 0 : (h < 8.0f) ? 1 : (h < 18.0f) ? 2 : 3;
+    }
+
+    // Solo se redibuja cuando cambia la fase o pasan unos 10 minutos
+    const int key = phase * 1000 + (night_forced ? 999 : (int)(h * 6.0f));
+    if (key == bg_key_) return;
+    bg_key_ = key;
+
+    const SkyInfo& sk = kSky[phase];
+    lv_obj_set_style_bg_color(sky_, C(sk.top), 0);
+    lv_obj_set_style_bg_grad_color(sky_, C(sk.bottom), 0);
+    lv_obj_set_style_bg_color(ground_, C(sk.ground), 0);
+    lv_obj_set_style_bg_color(body_, C(sk.body), 0);
+
+    // Sol de dia y luna de noche, recorriendo el cielo de izquierda a derecha
+    float frac = 0.5f;
+    if (!night_forced && valid) {
+        frac = (phase == 0) ? ((h >= 21.0f ? h - 21.0f : h + 3.0f) / 9.0f) : ((h - 6.0f) / 14.0f);
+    }
+    frac = std::min(1.0f, std::max(0.0f, frac));
+    lv_obj_set_pos(body_, 30 + (int)(frac * 376.0f), 170 - (int)(70.0f * sinf(frac * 3.14159f)));
+
+    for (int i = 0; i < 10; i++) Show(stars_[i], phase == 0);
+}
+
 void Tamagotchi::RefreshUI() {
     if (!root_) return;
+    UpdateBackground();
     if (SpriteKey() != sprite_key_) BuildSprite();
     UpdateFace();
 
