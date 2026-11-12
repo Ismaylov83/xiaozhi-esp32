@@ -11,6 +11,7 @@
 #include "power_save_timer.h"
 #include "axp2101.h"
 #include "i2c_device.h"
+#include "tamagotchi.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -82,7 +83,7 @@ static const co5300_lcd_init_cmd_t vendor_specific_init[] = {
 class CustomLcdDisplay : public SpiLcdDisplay {
 public:
     static void rounder_event_cb(lv_event_t* e) {
-        lv_area_t* area = (lv_area_t* )lv_event_get_param(e);
+        lv_area_t* area = (lv_area_t*)lv_event_get_param(e);
         uint16_t x1 = area->x1;
         uint16_t x2 = area->x2;
 
@@ -149,7 +150,7 @@ protected:
     virtual void SetBrightnessImpl(uint8_t brightness) override {
         auto display = Board::GetInstance().GetDisplay();
         DisplayLockGuard lock(display);
-        uint8_t data[1] = {((uint8_t)((255*  brightness) / 100))};
+        uint8_t data[1] = {((uint8_t)((255 * brightness) / 100))};
         int lcd_cmd = 0x51;
         lcd_cmd &= 0xff;
         lcd_cmd <<= 8;
@@ -163,6 +164,7 @@ private:
     i2c_master_bus_handle_t i2c_bus_;
     Pmic* pmic_ = nullptr;
     Button boot_button_;
+    Button mode_button_;
     CustomLcdDisplay* display_;
     CustomBacklight* backlight_;
     esp_io_expander_handle_t io_expander = NULL;
@@ -176,8 +178,11 @@ private:
         power_save_timer_->OnExitSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness(); });
-        power_save_timer_->OnShutdownRequest([this](){ 
-            pmic_->PowerOff(); });
+        power_save_timer_->OnShutdownRequest([this](){
+            // En modo mascota la placa no se apaga sola
+            if (!Tamagotchi::GetInstance().IsVisible()) {
+                pmic_->PowerOff();
+            } });
         power_save_timer_->SetEnabled(true);
     }
 
@@ -215,7 +220,7 @@ private:
         buscfg.data1_io_num = EXAMPLE_PIN_NUM_LCD_DATA1;
         buscfg.data2_io_num = EXAMPLE_PIN_NUM_LCD_DATA2;
         buscfg.data3_io_num = EXAMPLE_PIN_NUM_LCD_DATA3;
-        buscfg.max_transfer_sz = DISPLAY_WIDTH*  DISPLAY_HEIGHT*  sizeof(uint16_t);
+        buscfg.max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
         buscfg.flags = SPICOMMON_BUSFLAG_QUAD;
         ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
     }
@@ -238,6 +243,19 @@ private:
             }
         });
 #endif
+
+        // Boton del GPIO 18: cambia entre modo asistente y modo mascota
+        mode_button_.OnClick([this]() {
+            Tamagotchi::GetInstance().Toggle();
+        });
+    }
+
+    void InitializeTamagotchi() {
+        auto& pet = Tamagotchi::GetInstance();
+        pet.SetActivityCallback([this]() {
+            power_save_timer_->WakeUp();
+        });
+        pet.Init(display_);
     }
 
     void InitializeDisplay() {
@@ -270,7 +288,7 @@ private:
         panel_config.reset_gpio_num = EXAMPLE_PIN_NUM_LCD_RST;
         panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
         panel_config.bits_per_pixel = 16;
-        panel_config.vendor_config = (void* )&vendor_config;
+        panel_config.vendor_config = (void*)&vendor_config;
         ESP_ERROR_CHECK(esp_lcd_new_panel_co5300(panel_io, &panel_config, &panel));
         esp_lcd_panel_reset(panel);
         esp_lcd_panel_init(panel);
@@ -302,7 +320,7 @@ private:
         };
         esp_lcd_panel_io_handle_t tp_io_handle = NULL;
         esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_CST9217_CONFIG();
-        tp_io_config.scl_speed_hz = 400*  1000;
+        tp_io_config.scl_speed_hz = 400 * 1000;
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle));
         ESP_LOGI(TAG, "Initialize touch controller");
         ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_cst9217(tp_io_handle, &tp_cfg, &tp));
@@ -327,7 +345,7 @@ private:
     }
 
 public:
-    WaveshareEsp32s3TouchAMOLED2inch16() : boot_button_(BOOT_BUTTON_GPIO) {
+    WaveshareEsp32s3TouchAMOLED2inch16() : boot_button_(BOOT_BUTTON_GPIO), mode_button_(MODE_BUTTON_GPIO) {
         InitializePowerSaveTimer();
         InitializeCodecI2c();
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_1_75
@@ -338,22 +356,23 @@ public:
         InitializeDisplay();
         InitializeTouch();
         InitializeButtons();
+        InitializeTamagotchi();
         InitializeTools();
     }
 
     virtual AudioCodec* GetAudioCodec() override {
         static BoxAudioCodec audio_codec(
-            i2c_bus_, 
-            AUDIO_INPUT_SAMPLE_RATE, 
+            i2c_bus_,
+            AUDIO_INPUT_SAMPLE_RATE,
             AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_GPIO_MCLK, 
-            AUDIO_I2S_GPIO_BCLK, 
-            AUDIO_I2S_GPIO_WS, 
-            AUDIO_I2S_GPIO_DOUT, 
+            AUDIO_I2S_GPIO_MCLK,
+            AUDIO_I2S_GPIO_BCLK,
+            AUDIO_I2S_GPIO_WS,
+            AUDIO_I2S_GPIO_DOUT,
             AUDIO_I2S_GPIO_DIN,
-            AUDIO_CODEC_PA_PIN, 
-            AUDIO_CODEC_ES8311_ADDR, 
-            AUDIO_CODEC_ES7210_ADDR, 
+            AUDIO_CODEC_PA_PIN,
+            AUDIO_CODEC_ES8311_ADDR,
+            AUDIO_CODEC_ES7210_ADDR,
             AUDIO_INPUT_REFERENCE,
             30.0f, -1, 0.0f, AUDIO_CODEC_PA_VOLTAGE);
         return &audio_codec;
