@@ -57,6 +57,8 @@ private:
     void RefreshDayPanel();
     void OpenEditor();
     void UpdateEditLabels();
+    void UpdateEditText();
+    void TypeKey(int id);
     void SaveEvent();
     void DeleteEvent(int idx);
     void OpenUpcoming();
@@ -104,8 +106,9 @@ private:
     lv_obj_t* edit_h_lbl_ = nullptr;
     lv_obj_t* edit_m_lbl_ = nullptr;
     lv_obj_t* edit_remind_btn_ = nullptr;
-    lv_obj_t* ta_ = nullptr;
-    lv_obj_t* kb_ = nullptr;
+    lv_obj_t* edit_txt_lbl_ = nullptr;
+    char edit_text_[40] = {0};
+    int edit_len_ = 0;
 
     lv_obj_t* up_panel_ = nullptr;
     lv_obj_t* up_title_ = nullptr;
