@@ -163,6 +163,15 @@ lv_obj_t* MakeButton(lv_obj_t* parent, int x, int y, int w, int h, uint32_t colo
     return b;
 }
 
+// Objeto que reacciona en cuanto se toca (para los minijuegos)
+lv_obj_t* MakeTouch(lv_obj_t* parent, int x, int y, int w, int h, uint32_t color, int radius,
+                    int id) {
+    lv_obj_t* o = Box(parent, x, y, w, h, C(color), radius);
+    lv_obj_add_flag(o, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(o, OnBtnEvent, LV_EVENT_PRESSED, (void*)(intptr_t)id);
+    return o;
+}
+
 }  // namespace
 
 Tamagotchi& Tamagotchi::GetInstance() {
@@ -456,6 +465,8 @@ void Tamagotchi::Toggle() {
         RefreshUI();
     } else {
         ShowPopup(false);
+        ShowGamePopup(false);
+        if (game_active_) EndGame(false);
         Show(root_, false);
     }
     Activity();
@@ -472,6 +483,13 @@ void Tamagotchi::OnRootTap() {
 
 void Tamagotchi::ShowPopup(bool show) {
     Show(popup_, show);
+    if (show) Show(gpopup_, false);
+    popup_frames_ = show ? 20 : 0;
+}
+
+void Tamagotchi::ShowGamePopup(bool show) {
+    Show(gpopup_, show);
+    if (show) Show(popup_, false);
     popup_frames_ = show ? 20 : 0;
 }
 
@@ -513,6 +531,10 @@ void Tamagotchi::HandleButton(int id) {
         RefreshUI();
         return;
     }
+    if (id >= 30 && id <= 39) {  // toques dentro de los minijuegos nuevos
+        OnMiniTap(id - 30);
+        return;
+    }
     if (game_active_) {
         if (id == 1) EndGame(false);  // pulsar JUEGO otra vez = salir
         RefreshUI();
@@ -539,6 +561,18 @@ void Tamagotchi::HandleButton(int id) {
             ShowPopup(!(popup_ && !lv_obj_has_flag(popup_, LV_OBJ_FLAG_HIDDEN)));
             break;
         case 1:
+            ShowGamePopup(!(gpopup_ && !lv_obj_has_flag(gpopup_, LV_OBJ_FLAG_HIDDEN)));
+            break;
+        case 40:
+            StartCatch();
+            break;
+        case 41:
+            StartBag();
+            break;
+        case 42:
+            StartMemo();
+            break;
+        case 43:
             StartGame();
             break;
         case 3:  // medicina
@@ -595,11 +629,9 @@ void Tamagotchi::HandleButton(int id) {
 // ---------------------------------------------------------------------------
 
 void Tamagotchi::StartGame() {
-    ShowPopup(false);
-    game_active_ = true;
+    BeginMini(1);
     game_round_ = 0;
     game_wins_ = 0;
-    game_wait_frames_ = 0;
     Show(game_, true);
     NextRound();
 }
@@ -649,8 +681,16 @@ void Tamagotchi::GameTick() {
 void Tamagotchi::EndGame(bool finished) {
     game_active_ = false;
     game_awaiting_ = false;
+    game_type_ = 0;
+    target_ = nullptr;
+    for (int i = 0; i < 4; i++) pads_[i] = nullptr;
     look_ = 0;
     Show(game_, false);
+    if (game_area_) {
+        lv_obj_clean(game_area_);
+        Show(game_area_, false);
+    }
+    Show(cont_, true);
     if (!finished) return;
     char buf[64];
     if (game_wins_ >= 3) {
@@ -659,6 +699,208 @@ void Tamagotchi::EndGame(bool finished) {
         snprintf(buf, sizeof(buf), "Ganaste %d/5! Esta feliz", game_wins_);
     } else {
         snprintf(buf, sizeof(buf), "Perdiste (%d/5). Otra vez?", game_wins_);
+    }
+    SetMessage(buf, 16);
+    UpdateCall();
+    Save();
+}
+
+// ---------------------------------------------------------------------------
+// Minijuegos: ATRAPA (bolas), SACO (golpes rapidos) y MEMO (colores)
+// ---------------------------------------------------------------------------
+
+void Tamagotchi::BeginMini(int type) {
+    ShowPopup(false);
+    ShowGamePopup(false);
+    game_active_ = true;
+    game_awaiting_ = false;
+    game_wait_frames_ = 0;
+    game_type_ = type;
+    game_score_ = 0;
+    target_ = nullptr;
+    for (int i = 0; i < 4; i++) pads_[i] = nullptr;
+    lv_obj_clean(game_area_);
+    Show(game_area_, true);
+    Show(game_, false);
+    Show(cont_, type != 3 && type != 4);  // saco y memoria ocupan el centro
+}
+
+void Tamagotchi::StartCatch() {
+    BeginMini(2);
+    game_frames_ = 80;  // 20 segundos
+    catch_life_ = 0;
+    snprintf(game_text_, sizeof(game_text_), "ATRAPA las bolas antes de que desaparezcan!");
+}
+
+void Tamagotchi::StartBag() {
+    BeginMini(3);
+    game_frames_ = 40;  // 10 segundos
+    bag_pulse_ = 0;
+    target_ = MakeTouch(game_area_, 155, 40, 170, 170, 0x8B5A2B, LV_RADIUS_CIRCLE, 31);
+    snprintf(game_text_, sizeof(game_text_), "SACO! Toca lo mas rapido que puedas");
+}
+
+void Tamagotchi::StartMemo() {
+    BeginMini(4);
+    const uint32_t cols[4] = {0xFF4D4D, 0x4D8DFF, 0x3DDC84, 0xFFD93D};
+    const int px[4] = {95, 255, 95, 255};
+    const int py[4] = {10, 10, 125, 125};
+    for (int i = 0; i < 4; i++) {
+        pads_[i] = MakeTouch(game_area_, px[i], py[i], 130, 105, cols[i], 24, 32 + i);
+    }
+    SetPads(-1);
+    for (int i = 0; i < 8; i++) memo_seq_[i] = (uint8_t)Rnd(4);
+    memo_len_ = 2;
+    memo_phase_ = 0;
+    memo_timer_ = -4;
+    memo_input_ = 0;
+    memo_flash_ = 0;
+    memo_ok_ = false;
+    snprintf(game_text_, sizeof(game_text_), "MEMO! Memoriza la secuencia de colores");
+}
+
+void Tamagotchi::SetPads(int lit) {
+    for (int i = 0; i < 4; i++) {
+        if (pads_[i]) lv_obj_set_style_bg_opa(pads_[i], i == lit ? LV_OPA_COVER : LV_OPA_40, 0);
+    }
+}
+
+void Tamagotchi::OnMiniTap(int k) {
+    if (!game_active_) return;
+    if (game_type_ == 2 && k == 0) {
+        if (!target_) return;
+        game_score_++;
+        lv_obj_delete_async(target_);
+        target_ = nullptr;
+        catch_life_ = 0;
+    } else if (game_type_ == 3 && k == 1) {
+        game_score_++;
+        bag_pulse_ = 1;
+    } else if (game_type_ == 4 && k >= 2 && k <= 5 && memo_phase_ == 1) {
+        const int pad = k - 2;
+        SetPads(pad);
+        memo_flash_ = 2;
+        if (pad == memo_seq_[memo_input_]) {
+            memo_input_++;
+            if (memo_input_ >= memo_len_) {
+                memo_ok_ = true;
+                memo_phase_ = 2;
+                memo_timer_ = 4;
+                snprintf(game_text_, sizeof(game_text_), "Muy bien!");
+            }
+        } else {
+            memo_ok_ = false;
+            memo_phase_ = 2;
+            memo_timer_ = 4;
+            snprintf(game_text_, sizeof(game_text_), "Fallaste!");
+        }
+    }
+}
+
+void Tamagotchi::MiniTick() {
+    if (!game_active_ || game_type_ < 2) return;
+    if (!st_.alive) {
+        EndGame(false);
+        return;
+    }
+    switch (game_type_) {
+        case 2: {  // ATRAPA
+            if (--game_frames_ <= 0) {
+                FinishMini(game_score_ >= 8);
+                return;
+            }
+            if (target_) {
+                if (--catch_life_ <= 0) {
+                    lv_obj_delete(target_);
+                    target_ = nullptr;
+                }
+            } else {
+                static const uint32_t cols[5] = {0xFF6B6B, 0xFECA57, 0x54A0FF, 0x1DD1A1, 0xA29BFE};
+                target_ = MakeTouch(game_area_, 30 + (int)Rnd(356), 10 + (int)Rnd(170), 64, 64,
+                                    cols[Rnd(5)], LV_RADIUS_CIRCLE, 30);
+                catch_life_ = std::max(3, 7 - game_score_ / 4);
+            }
+            snprintf(game_text_, sizeof(game_text_), "ATRAPA! Tiempo %d  Puntos %d (meta 8)",
+                     (game_frames_ + 3) / 4, game_score_);
+            break;
+        }
+        case 3: {  // SACO
+            if (--game_frames_ <= 0) {
+                FinishMini(game_score_ >= 25);
+                return;
+            }
+            if (target_) {
+                const int d = 170 + 16 * bag_pulse_;
+                lv_obj_set_size(target_, d, d);
+                lv_obj_set_pos(target_, 240 - d / 2, 125 - d / 2);
+                bag_pulse_ = 0;
+            }
+            snprintf(game_text_, sizeof(game_text_), "SACO! Tiempo %d  Golpes %d (meta 25)",
+                     (game_frames_ + 3) / 4, game_score_);
+            break;
+        }
+        case 4: {  // MEMO
+            if (memo_phase_ == 0) {  // muestra la secuencia
+                if (memo_timer_ < 0) {
+                    memo_timer_++;
+                    break;
+                }
+                const int step = memo_timer_ / 4;
+                const int sub = memo_timer_ % 4;
+                if (step >= memo_len_) {
+                    SetPads(-1);
+                    memo_phase_ = 1;
+                    memo_input_ = 0;
+                    snprintf(game_text_, sizeof(game_text_), "Tu turno! Repite la secuencia (%d)",
+                             memo_len_);
+                } else {
+                    SetPads(sub < 2 ? memo_seq_[step] : -1);
+                    memo_timer_++;
+                }
+            } else if (memo_phase_ == 1) {  // el jugador repite
+                if (memo_flash_ > 0 && --memo_flash_ == 0) SetPads(-1);
+            } else {  // resultado de la ronda
+                if (memo_flash_ > 0 && --memo_flash_ == 0) SetPads(-1);
+                if (--memo_timer_ <= 0) {
+                    if (!memo_ok_) {
+                        game_score_ = memo_len_ - 1;
+                        FinishMini(false);
+                        return;
+                    }
+                    if (memo_len_ >= 5) {
+                        game_score_ = memo_len_;
+                        FinishMini(true);
+                        return;
+                    }
+                    memo_len_++;
+                    memo_phase_ = 0;
+                    memo_timer_ = -4;
+                    snprintf(game_text_, sizeof(game_text_), "Bien! Mira la siguiente...");
+                }
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+void Tamagotchi::FinishMini(bool win) {
+    const int type = game_type_;
+    const int score = game_score_;
+    EndGame(false);
+    char buf[64];
+    if (win) {
+        if (st_.happy < 4) st_.happy++;
+        if (type == 3) {
+            st_.weight = st_.weight > 7 ? st_.weight - 2 : 5;
+        } else if (st_.weight > 5) {
+            st_.weight--;
+        }
+        if (type == 4) st_.discipline = (uint8_t)std::min(100, st_.discipline + 10);
+        snprintf(buf, sizeof(buf), "Ganaste! (%d) Esta feliz", score);
+    } else {
+        snprintf(buf, sizeof(buf), "Perdiste (%d). Otra vez?", score);
     }
     SetMessage(buf, 16);
     UpdateCall();
@@ -694,8 +936,12 @@ void Tamagotchi::Tick() {
     blink_ = (frame_ % 20) == 0;
     if (eat_frames_ > 0) eat_frames_--;
     if (msg_frames_ > 0) msg_frames_--;
-    if (popup_frames_ > 0 && --popup_frames_ == 0) Show(popup_, false);
+    if (popup_frames_ > 0 && --popup_frames_ == 0) {
+        Show(popup_, false);
+        Show(gpopup_, false);
+    }
     GameTick();
+    MiniTick();
 
     // Punto rojo parpadeante cuando la mascota necesita algo y estas en modo asistente
     const bool attention = !st_.alive || st_.call != 0 || notify_;
@@ -805,6 +1051,20 @@ void Tamagotchi::BuildUI() {
     MakeButton(game_, 30, 60, 100, 170, 0x54A0FF, 28, "< IZQ", 20);
     MakeButton(game_, 350, 60, 100, 170, 0xFF6B6B, 28, "DER >", 21);
     Show(game_, false);
+
+    // Menu para elegir minijuego
+    gpopup_ = Box(root_, 20, 346, 440, 42, C(0x1E1E2E), 14);
+    lv_obj_add_flag(gpopup_, LV_OBJ_FLAG_CLICKABLE);
+    MakeButton(gpopup_, 6, 5, 104, 32, 0x54A0FF, 12, "ATRAPA", 40);
+    MakeButton(gpopup_, 114, 5, 104, 32, 0xFF6B6B, 12, "SACO", 41);
+    MakeButton(gpopup_, 222, 5, 104, 32, 0x1DD1A1, 12, "MEMO", 42);
+    MakeButton(gpopup_, 330, 5, 104, 32, 0xA29BFE, 12, "MIRA", 43);
+    Show(gpopup_, false);
+
+    // Zona donde se dibujan los minijuegos nuevos
+    game_area_ = Box(root_, 0, 96, kW, 250, C(0x000000), 0);
+    lv_obj_set_style_bg_opa(game_area_, LV_OPA_TRANSP, 0);
+    Show(game_area_, false);
 
     // Aviso en modo asistente
     alert_ = Circle(lv_layer_top(), 232, 456, 16, C(0xFF3B30));
