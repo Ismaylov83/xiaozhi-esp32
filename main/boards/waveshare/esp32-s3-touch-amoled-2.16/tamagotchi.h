@@ -89,6 +89,7 @@ private:
     void BuildTomb();
     void UpdateFace();
     void RefreshUI();
+    void UpdateBackground();
     uint32_t SpriteKey() const;
     bool EggCracked() const;
 
@@ -144,6 +145,11 @@ private:
     lv_obj_t* game_area_ = nullptr;
     lv_obj_t* target_ = nullptr;
     lv_obj_t* pads_[4] = {};
+    lv_obj_t* sky_ = nullptr;
+    lv_obj_t* ground_ = nullptr;
+    lv_obj_t* body_ = nullptr;  // sol o luna
+    lv_obj_t* stars_[10] = {};
+    int bg_key_ = -1;
     lv_obj_t* hunger_dot_[4] = {};
     lv_obj_t* happy_dot_[4] = {};
     lv_obj_t* poop_[4][2] = {};
