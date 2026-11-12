@@ -35,6 +35,9 @@ const char* kWdShort[7] = {"L", "M", "X", "J", "V", "S", "D"};
 // Segmentos a b c d e f g (bit 0 a bit 6) de cada cifra
 const uint8_t kSegMask[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
 
+// Teclas del teclado propio (39 teclas, 10 por fila)
+const char* const kKeys = "1234567890qwertyuiopasdfghjkl-zxcvbnm,.";
+
 lv_color_t C(uint32_t hex) { return lv_color_hex(hex); }
 
 void Show(lv_obj_t* o, bool on) {
@@ -394,18 +397,17 @@ void Agenda::BuildUI() {
     MakeButton(edit_panel_, 346, 58, 44, 40, kPanel, 10, "+", 33, 0xFFFFFF);
     edit_remind_btn_ = MakeButton(edit_panel_, 50, 106, 380, 36, 0xFF4D4D, 10, "", 34, 0xFFFFFF);
 
-    ta_ = lv_textarea_create(edit_panel_);
-    lv_obj_set_pos(ta_, 50, 150);
-    lv_obj_set_size(ta_, 380, 44);
-    lv_textarea_set_one_line(ta_, true);
-    lv_textarea_set_max_length(ta_, 39);
-    lv_textarea_set_placeholder_text(ta_, "Texto de la cita");
-    lv_obj_set_style_text_font(ta_, kFont, 0);
-
-    kb_ = lv_keyboard_create(edit_panel_);
-    lv_obj_set_pos(kb_, 50, 200);
-    lv_obj_set_size(kb_, 380, 200);
-    lv_keyboard_set_textarea(kb_, ta_);
+    // Campo de texto y teclado propios (no dependen de los widgets de LVGL)
+    lv_obj_t* field = Box(edit_panel_, 50, 150, 380, 44, C(kPanel), 10);
+    edit_txt_lbl_ = MakeLabel(field, "", 0xFFFFFF, LV_ALIGN_LEFT_MID, 12, 0, 356);
+    lv_obj_set_style_text_align(edit_txt_lbl_, LV_TEXT_ALIGN_LEFT, 0);
+    for (int i = 0; i < 39; i++) {
+        const int r = i / 10, c = i % 10;
+        const char s[2] = {kKeys[i], 0};
+        MakeButton(edit_panel_, 50 + c * 38, 200 + r * 38, 36, 34, kPanel, 6, s, 200 + i, 0xFFFFFF);
+    }
+    MakeButton(edit_panel_, 50 + 9 * 38, 200 + 3 * 38, 36, 34, 0xFF6B6B, 6, "<", 290);
+    MakeButton(edit_panel_, 50, 200 + 4 * 38, 380, 34, kPanel, 6, "ESPACIO", 291, 0xFFFFFF);
 
     MakeButton(edit_panel_, 60, 410, 170, 48, 0x1DD1A1, 14, "GUARDAR", 35);
     MakeButton(edit_panel_, 250, 410, 170, 48, kPanel, 14, "CANCELAR", 36, 0xFFFFFF);
@@ -555,6 +557,36 @@ void Agenda::UpdateEditLabels() {
     if (l) SetLabel(l, edit_remind_ ? "Aviso sonoro: SI" : "Aviso sonoro: NO");
 }
 
+void Agenda::UpdateEditText() {
+    if (edit_len_ == 0) {
+        lv_obj_set_style_text_color(edit_txt_lbl_, C(0x6F7FA5), 0);
+        SetLabel(edit_txt_lbl_, "Escribe el texto de la cita");
+    } else {
+        char buf[48];
+        lv_obj_set_style_text_color(edit_txt_lbl_, C(0xFFFFFF), 0);
+        snprintf(buf, sizeof(buf), "%s_", edit_text_);
+        SetLabel(edit_txt_lbl_, buf);
+    }
+}
+
+void Agenda::TypeKey(int id) {
+    if (id == 290) {  // borrar
+        if (edit_len_ > 0) edit_text_[--edit_len_] = 0;
+    } else if (edit_len_ < 39) {
+        char ch = 0;
+        if (id == 291) {
+            ch = ' ';
+        } else if (id >= 200 && id < 200 + (int)strlen(kKeys)) {
+            ch = kKeys[id - 200];
+        }
+        if (ch) {
+            edit_text_[edit_len_++] = ch;
+            edit_text_[edit_len_] = 0;
+        }
+    }
+    UpdateEditText();
+}
+
 void Agenda::OpenEditor() {
     char buf[64];
     snprintf(buf, sizeof(buf), "Nueva cita - %02d/%02d/%d", sel_day_, view_m_, view_y_);
@@ -562,7 +594,9 @@ void Agenda::OpenEditor() {
     edit_h_ = (time_ok_ && hour_ >= 0) ? (hour_ + 1) % 24 : 9;
     edit_m_ = 0;
     edit_remind_ = true;
-    lv_textarea_set_text(ta_, "");
+    edit_text_[0] = 0;
+    edit_len_ = 0;
+    UpdateEditText();
     UpdateEditLabels();
     Show(edit_panel_, true);
 }
@@ -580,7 +614,7 @@ void Agenda::SaveEvent() {
     e.hour = (uint8_t)edit_h_;
     e.minute = (uint8_t)edit_m_;
     e.remind = edit_remind_ ? 1 : 0;
-    const char* txt = lv_textarea_get_text(ta_);
+    const char* txt = edit_text_;
     snprintf(e.text, sizeof(e.text), "%s", (txt && txt[0]) ? txt : "Cita");
     events_.push_back(e);
     std::sort(events_.begin(), events_.end(), [](const Event& a, const Event& b) {
@@ -627,6 +661,10 @@ void Agenda::OpenUpcoming() {
 void Agenda::HandleButton(int id) {
     Activity();
 
+    if (id >= 200 && id < 300) {  // tecla del teclado
+        TypeKey(id);
+        return;
+    }
     if (id >= 100 && id < 142) {  // un dia del calendario
         const int off = FirstWeekdayMon(view_y_, view_m_);
         const int day = (id - 100) - off + 1;
