@@ -12,6 +12,7 @@
 #include "axp2101.h"
 #include "i2c_device.h"
 #include "tamagotchi.h"
+#include "agenda.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -165,6 +166,7 @@ private:
     Pmic* pmic_ = nullptr;
     Button boot_button_;
     Button mode_button_;
+    int mode_ = 0;  // 0 asistente, 1 mascota, 2 agenda
     CustomLcdDisplay* display_;
     CustomBacklight* backlight_;
     esp_io_expander_handle_t io_expander = NULL;
@@ -179,8 +181,8 @@ private:
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness(); });
         power_save_timer_->OnShutdownRequest([this](){
-            // En modo mascota la placa no se apaga sola
-            if (!Tamagotchi::GetInstance().IsVisible()) {
+            // En modo mascota o agenda la placa no se apaga sola
+            if (!Tamagotchi::GetInstance().IsVisible() && !Agenda::GetInstance().IsVisible()) {
                 pmic_->PowerOff();
             } });
         power_save_timer_->SetEnabled(true);
@@ -246,8 +248,28 @@ private:
 
         // Boton del GPIO 18: cambia entre modo asistente y modo mascota
         mode_button_.OnClick([this]() {
-            Tamagotchi::GetInstance().Toggle();
+            CycleMode();
         });
+    }
+
+    // Asistente -> mascota -> agenda -> asistente...
+    void CycleMode() {
+        auto& pet = Tamagotchi::GetInstance();
+        auto& agenda = Agenda::GetInstance();
+        mode_ = (mode_ + 1) % 3;
+        if (pet.IsVisible() != (mode_ == 1)) {
+            pet.Toggle();
+        }
+        agenda.SetVisible(mode_ == 2);
+        power_save_timer_->WakeUp();
+    }
+
+    void InitializeAgenda() {
+        auto& agenda = Agenda::GetInstance();
+        agenda.SetActivityCallback([this]() {
+            power_save_timer_->WakeUp();
+        });
+        agenda.Init(display_);
     }
 
     void InitializeTamagotchi() {
@@ -357,6 +379,7 @@ public:
         InitializeTouch();
         InitializeButtons();
         InitializeTamagotchi();
+        InitializeAgenda();
         InitializeTools();
     }
 
