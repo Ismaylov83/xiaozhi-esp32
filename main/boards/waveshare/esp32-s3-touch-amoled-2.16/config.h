@@ -27,6 +27,9 @@
 #define I2C_ADDRESS         ESP_IO_EXPANDER_I2C_TCA9554_ADDRESS_000
 #define BOOT_BUTTON_GPIO GPIO_NUM_0
 
+// Boton libre de la placa (GPIO 18): cambia entre modo asistente y modo mascota
+#define MODE_BUTTON_GPIO GPIO_NUM_18
+
 #define EXAMPLE_PIN_NUM_LCD_CS GPIO_NUM_12
 #define EXAMPLE_PIN_NUM_LCD_PCLK GPIO_NUM_38
 #define EXAMPLE_PIN_NUM_LCD_DATA0 GPIO_NUM_4
