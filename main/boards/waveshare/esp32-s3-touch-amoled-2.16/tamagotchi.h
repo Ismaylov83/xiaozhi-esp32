@@ -64,6 +64,7 @@ private:
     void SetMessage(const char* text, int frames);
     void Feed(bool snack);
     void ShowPopup(bool show);
+    void ShowGamePopup(bool show);
     const char* StatusText() const;
 
     // Minijuego
@@ -72,6 +73,14 @@ private:
     void OnGamePick(int side);
     void GameTick();
     void EndGame(bool finished);
+    void BeginMini(int type);
+    void StartCatch();
+    void StartBag();
+    void StartMemo();
+    void MiniTick();
+    void OnMiniTap(int k);
+    void FinishMini(bool win);
+    void SetPads(int lit);
 
     // Dibujo
     void BuildUI();
@@ -107,6 +116,18 @@ private:
     int64_t last_s_ = 0;
     char msg_[64] = {0};
     char game_text_[80] = {0};
+    int game_type_ = 0;  // 0 ninguno, 1 mirar, 2 atrapa, 3 saco, 4 memoria
+    int game_score_ = 0;
+    int game_frames_ = 0;
+    int catch_life_ = 0;
+    int bag_pulse_ = 0;
+    int memo_len_ = 2;
+    int memo_phase_ = 0;
+    int memo_timer_ = 0;
+    int memo_input_ = 0;
+    int memo_flash_ = 0;
+    bool memo_ok_ = false;
+    uint8_t memo_seq_[8] = {0};
 
     // Widgets
     lv_obj_t* root_ = nullptr;
@@ -119,6 +140,10 @@ private:
     lv_obj_t* popup_ = nullptr;
     lv_obj_t* game_ = nullptr;
     lv_obj_t* alert_ = nullptr;
+    lv_obj_t* gpopup_ = nullptr;
+    lv_obj_t* game_area_ = nullptr;
+    lv_obj_t* target_ = nullptr;
+    lv_obj_t* pads_[4] = {};
     lv_obj_t* hunger_dot_[4] = {};
     lv_obj_t* happy_dot_[4] = {};
     lv_obj_t* poop_[4][2] = {};
