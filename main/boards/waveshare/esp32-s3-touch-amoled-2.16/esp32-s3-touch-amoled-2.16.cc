@@ -185,7 +185,7 @@ private:
             // En modo mascota o agenda la placa no se apaga sola
             if (!Tamagotchi::GetInstance().IsVisible() && !Agenda::GetInstance().IsVisible() &&
                 !Agenda::GetInstance().HasPendingReminders() &&
-                !Radio::GetInstance().IsVisible()) {
+                !Radio::GetInstance().IsVisible() && !Radio::GetInstance().IsPlaying()) {
                 pmic_->PowerOff();
             } });
         power_save_timer_->SetEnabled(true);
