@@ -13,6 +13,7 @@
 #include "i2c_device.h"
 #include "tamagotchi.h"
 #include "agenda.h"
+#include "radio.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -166,7 +167,7 @@ private:
     Pmic* pmic_ = nullptr;
     Button boot_button_;
     Button mode_button_;
-    int mode_ = 0;  // 0 asistente, 1 mascota, 2 agenda
+    int mode_ = 0;  // 0 asistente, 1 mascota, 2 agenda, 3 radio
     CustomLcdDisplay* display_;
     CustomBacklight* backlight_;
     esp_io_expander_handle_t io_expander = NULL;
@@ -183,7 +184,8 @@ private:
         power_save_timer_->OnShutdownRequest([this](){
             // En modo mascota o agenda la placa no se apaga sola
             if (!Tamagotchi::GetInstance().IsVisible() && !Agenda::GetInstance().IsVisible() &&
-                !Agenda::GetInstance().HasPendingReminders()) {
+                !Agenda::GetInstance().HasPendingReminders() &&
+                !Radio::GetInstance().IsVisible()) {
                 pmic_->PowerOff();
             } });
         power_save_timer_->SetEnabled(true);
@@ -253,16 +255,29 @@ private:
         });
     }
 
-    // Asistente -> mascota -> agenda -> asistente...
+    // Asistente -> mascota -> agenda -> radio -> asistente...
     void CycleMode() {
         auto& pet = Tamagotchi::GetInstance();
         auto& agenda = Agenda::GetInstance();
-        mode_ = (mode_ + 1) % 3;
+        mode_ = (mode_ + 1) % 4;
         if (pet.IsVisible() != (mode_ == 1)) {
             pet.Toggle();
         }
         agenda.SetVisible(mode_ == 2);
+        Radio::GetInstance().SetVisible(mode_ == 3);
         power_save_timer_->WakeUp();
+    }
+
+    void InitializeRadio() {
+        auto& radio = Radio::GetInstance();
+        radio.SetActivityCallback([this]() {
+            power_save_timer_->WakeUp();
+        });
+        radio.SetBatteryProvider([this](int& level, bool& charging) {
+            bool discharging = false;
+            return GetBatteryLevel(level, charging, discharging);
+        });
+        radio.Init(display_);
     }
 
     void InitializeAgenda() {
@@ -385,6 +400,7 @@ public:
         InitializeButtons();
         InitializeTamagotchi();
         InitializeAgenda();
+        InitializeRadio();
         InitializeTools();
     }
 
