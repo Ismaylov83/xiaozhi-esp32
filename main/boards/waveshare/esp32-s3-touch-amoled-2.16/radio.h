@@ -2,6 +2,7 @@
 
 #include <lvgl.h>
 
+#include <atomic>
 #include <functional>
 #include <stdint.h>
 #include <string>
@@ -18,6 +19,8 @@ public:
     void Init(Display* display);
     void SetVisible(bool visible);
     bool IsVisible() const { return visible_; }
+    // true mientras suena una emisora o un archivo (la placa no debe apagarse sola)
+    bool IsPlaying() const { return playing_; }
     void SetActivityCallback(std::function<void()> cb) { on_activity_ = std::move(cb); }
     // Devuelve el nivel de bateria (0-100) y si esta cargando.
     void SetBatteryProvider(std::function<bool(int&, bool&)> cb) { battery_cb_ = std::move(cb); }
@@ -26,8 +29,10 @@ public:
     void Tick();
     void HandleButton(int id);
     void RebuildSdList();
+    void BarsTick();
 
 private:
+    static void CmdTask(void* arg);
     Radio() = default;
 
     struct Station {
@@ -62,6 +67,14 @@ private:
     void RefreshClock();
     void UpdateStatusIcons();
 
+    // Reproduccion
+    void EnsurePlayer();
+    void SendCmd(int type, const std::string& url = "", const std::string& title = "");
+    void StartPlayback(const std::string& source, const std::string& title, bool is_file);
+    void StartStation();
+    void StopPlayback(const char* status);
+    void SetStatus(const char* text);
+
     static constexpr int kMaxStations = 40;
     static constexpr int kMaxSdEntries = 200;
 
@@ -70,7 +83,16 @@ private:
     std::function<bool(int&, bool&)> battery_cb_;
 
     bool visible_ = false;
-    bool playing_ = false;
+    std::atomic<bool> playing_{false};
+    bool is_file_ = false;
+    bool player_ready_ = false;
+    int retries_ = 0;
+    int reconnect_in_ = 0;
+    std::string cur_source_;
+    std::string cur_title_;
+    std::string status_;
+    void* cmd_q_ = nullptr;
+    int bar_h_[16] = {};
     bool muted_ = false;
     int volume_ = 70;
     int selected_ = 0;
