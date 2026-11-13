@@ -37,7 +37,7 @@ constexpr uint32_t kOff = 0x1C2540;
 const lv_font_t* kFont = LV_FONT_DEFAULT;
 
 const char* kMonths[12] = {"Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
-                           "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"};
+                            "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"};
 const char* kWeekdays[7] = {"Domingo", "Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado"};
 const char* kWdAbbr[7] = {"Dom", "Lun", "Mar", "Mie", "Jue", "Vie", "Sab"};
 const char* kWdShort[7] = {"L", "M", "X", "J", "V", "S", "D"};
@@ -441,6 +441,7 @@ std::string Agenda::AddEventApi(int y, int m, int d, int h, int mi, const std::s
     size_t n = std::min<size_t>(text.size(), sizeof(e.text) - 1);
     while (n > 0 && n < text.size() && ((uint8_t)text[n] & 0xC0) == 0x80) n--;  // no cortar un caracter UTF-8
     memcpy(e.text, text.data(), n);
+    e.text[n] = '\0';
     if (e.text[0] == 0) snprintf(e.text, sizeof(e.text), "Cita");
 
     const bool past = time_ok_ && EvKey(y, m, d, h, mi) <= NowKey();
@@ -451,10 +452,26 @@ std::string Agenda::AddEventApi(int y, int m, int d, int h, int mi, const std::s
     SaveEvents();
     RefreshAfterChange();
 
-    char buf[128];
-    snprintf(buf, sizeof(buf), "OK: added %04d-%02d-%02d %02d:%02d \"%s\"%s%s", y, m, d, h, mi,
-             e.text, remind ? " with sound reminder" : "", past ? " (this time is already in the past, it will not ring)" : "");
-    return buf;
+    std::string out = "OK: added ";
+    out += std::to_string(y);
+    out += "-";
+    out += (m < 10 ? "0" : "");
+    out += std::to_string(m);
+    out += "-";
+    out += (d < 10 ? "0" : "");
+    out += std::to_string(d);
+    out += " ";
+    out += (h < 10 ? "0" : "");
+    out += std::to_string(h);
+    out += ":";
+    out += (mi < 10 ? "0" : "");
+    out += std::to_string(mi);
+    out += " \"";
+    out += e.text;
+    out += "\"";
+    if (remind) out += " with sound reminder";
+    if (past) out += " (this time is already in the past, it will not ring)";
+    return out;
 }
 
 std::string Agenda::ListEventsApi(int y, int m, int d) {
