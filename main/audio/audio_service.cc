@@ -1,6 +1,8 @@
 #include "audio_service.h"
 #include <esp_log.h>
 #include <cstring>
+#include <atomic>
+extern std::atomic<bool> g_external_audio_active;
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)                                        \
     (esp_ae_rate_cvt_cfg_t) {                                                                \
@@ -835,6 +837,7 @@ bool AudioService::MarkPlaybackDrainedLocked() {
 }
 
 void AudioService::CheckAndUpdateAudioPowerState() {
+        if (g_external_audio_active.load()) { return; }
     auto now = std::chrono::steady_clock::now();
     auto input_elapsed =
         std::chrono::duration_cast<std::chrono::milliseconds>(now - last_input_time_).count();
