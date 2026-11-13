@@ -1,5 +1,17 @@
 #include "radio.h"
+#include "application.h"
+#include "board.h"
 #include "display/display.h"
+#include "mp3_player.h"
+
+#include <esp_http_client.h>
+#if __has_include(<esp_crt_bundle.h>)
+#include <esp_crt_bundle.h>
+#define RADIO_HAVE_CRT_BUNDLE 1
+#endif
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
 
 #include <driver/sdspi_host.h>
 #include <driver/spi_common.h>
@@ -12,6 +24,7 @@
 
 #include <algorithm>
 #include <dirent.h>
+#include <memory>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -112,6 +125,8 @@ void OnEvent(lv_event_t* e) {
 
 void OnTimer(lv_timer_t*) { Radio::GetInstance().Tick(); }
 
+void OnBarsTimer(lv_timer_t*) { Radio::GetInstance().BarsTick(); }
+
 void OnAsyncSd(void*) { Radio::GetInstance().RebuildSdList(); }
 
 lv_obj_t* MakeButton(lv_obj_t* parent, int x, int y, int w, int h, uint32_t color, int radius,
@@ -156,7 +171,157 @@ char FileKind(const std::string& name) {
     return ' ';
 }
 
+// ---------------------------------------------------------------------------
+// Conexion con el audio de xiaozhi y con internet / la SD
+// ---------------------------------------------------------------------------
+
+using namespace mydazy;
+
+std::atomic<int> g_gain{179};  // volumen de la radio, 0..256 (256 = sin cambio)
+std::atomic<uint8_t> g_levels[16];  // niveles para las barras
+
+// Envia el sonido ya decodificado al altavoz de xiaozhi
+class CodecOutput : public IAudioOutput {
+public:
+    int output_sample_rate() const override { return Codec()->output_sample_rate(); }
+    int output_channels() const override { return Codec()->output_channels(); }
+    bool output_enabled() const override { return Codec()->output_enabled(); }
+    void EnableOutput(bool enable) override { Codec()->EnableOutput(enable); }
+    void OutputData(std::vector<int16_t>& pcm) override {
+        const int gain = g_gain.load();
+        if (gain != 256) {
+            for (auto& s : pcm) s = (int16_t)(((int)s * gain) >> 8);
+        }
+        const size_t n = pcm.size();
+        if (n >= 64) {  // niveles de 16 tramos para el visualizador
+            const size_t seg = n / 16;
+            for (int b = 0; b < 16; b++) {
+                int peak = 0;
+                for (size_t i = (size_t)b * seg; i < (size_t)(b + 1) * seg; i += 4) {
+                    int v = pcm[i];
+                    if (v < 0) v = -v;
+                    if (v > peak) peak = v;
+                }
+                g_levels[b].store((uint8_t)std::min(255, peak >> 6));
+            }
+        }
+        Codec()->OutputData(pcm);
+    }
+
+private:
+    static auto* Codec() { return Board::GetInstance().GetAudioCodec(); }
+};
+
+// Cliente HTTP para el reproductor. Tambien lee archivos de la SD (rutas /sdcard/...).
+class RadioHttp : public IHttpClient {
+public:
+    ~RadioHttp() override { Close(); }
+
+    bool Open(const std::string& method, const std::string& url) override {
+        Close();
+        if (url.rfind("/sdcard/", 0) == 0 || url.rfind("file://", 0) == 0) {
+            const std::string path = url.rfind("file://", 0) == 0 ? url.substr(7) : url;
+            file_ = fopen(path.c_str(), "rb");
+            if (!file_) return false;
+            fseek(file_, 0, SEEK_END);
+            length_ = (size_t)ftell(file_);
+            fseek(file_, 0, SEEK_SET);
+            status_ = 200;
+            return true;
+        }
+
+        std::string cur = url;
+        for (int hop = 0; hop < 5; hop++) {
+            esp_http_client_config_t cfg = {};
+            cfg.url = cur.c_str();
+            cfg.timeout_ms = timeout_ms_;
+            cfg.buffer_size = 2048;
+            cfg.buffer_size_tx = 1024;
+#ifdef RADIO_HAVE_CRT_BUNDLE
+            cfg.crt_bundle_attach = esp_crt_bundle_attach;
+#endif
+            h_ = esp_http_client_init(&cfg);
+            if (!h_) return false;
+            esp_http_client_set_method(h_, method == "POST" ? HTTP_METHOD_POST : HTTP_METHOD_GET);
+            esp_http_client_set_header(h_, "Icy-MetaData", "0");
+            esp_http_client_set_header(h_, "User-Agent", "Mozilla/5.0 (ESP32 Radio)");
+            if (esp_http_client_open(h_, 0) != ESP_OK) {
+                Close();
+                return false;
+            }
+            const int64_t len = esp_http_client_fetch_headers(h_);
+            if (len < 0) {
+                Close();
+                return false;
+            }
+            status_ = esp_http_client_get_status_code(h_);
+            length_ = (size_t)len;
+            if (status_ == 301 || status_ == 302 || status_ == 303 || status_ == 307 ||
+                status_ == 308) {
+                char* loc = nullptr;
+                if (esp_http_client_get_header(h_, "Location", &loc) != ESP_OK || !loc) {
+                    Close();
+                    return false;
+                }
+                cur = loc;  // se copia antes de cerrar
+                Close();
+                continue;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    int GetStatusCode() override { return status_; }
+    size_t GetBodyLength() override { return length_; }
+
+    int Read(char* buf, size_t size) override {
+        if (file_) return (int)fread(buf, 1, size, file_);
+        if (!h_) return -1;
+        return esp_http_client_read(h_, buf, (int)size);
+    }
+
+    void Close() override {
+        if (file_) {
+            fclose(file_);
+            file_ = nullptr;
+        }
+        if (h_) {
+            esp_http_client_close(h_);
+            esp_http_client_cleanup(h_);
+            h_ = nullptr;
+        }
+    }
+
+    void SetTimeout(int ms) override { timeout_ms_ = ms; }
+
+private:
+    esp_http_client_handle_t h_ = nullptr;
+    FILE* file_ = nullptr;
+    int status_ = 0;
+    size_t length_ = 0;
+    int timeout_ms_ = 10000;
+};
+
+class RadioHttpFactory : public IHttpFactory {
+public:
+    std::unique_ptr<IHttpClient> CreateHttp() override { return std::make_unique<RadioHttp>(); }
+};
+
+CodecOutput g_output;
+RadioHttpFactory g_http_factory;
+
+// Orden para la tarea que arranca y para la reproduccion (Play/Stop pueden tardar)
+struct Cmd {
+    int type;  // 1 = reproducir, 0 = parar
+    char url[300];
+    char title[64];
+};
+
 }  // namespace
+
+// Lo lee audio_service.cc para no apagar el altavoz mientras suena la radio
+std::atomic<bool> g_external_audio_active{false};
 
 Radio& Radio::GetInstance() {
     static Radio instance;
@@ -175,7 +340,10 @@ void Radio::Init(Display* display) {
     LoadStations();
     BuildUI();
     RefreshAll();
+    cmd_q_ = xQueueCreate(4, sizeof(Cmd));
+    xTaskCreate(CmdTask, "radio_cmd", 6144, nullptr, 5, nullptr);
     lv_timer_create(OnTimer, 1000, nullptr);
+    lv_timer_create(OnBarsTimer, 120, nullptr);
     ESP_LOGI(TAG, "Radio lista (%u emisoras)", (unsigned)stations_.size());
 }
 
@@ -222,10 +390,147 @@ void Radio::SetVisible(bool visible) {
 }
 
 void Radio::Tick() {
-    if (!root_ || !visible_) return;
+    if (!root_) return;
     tick_count_++;
+
+    // Control de la reproduccion (funciona aunque la radio no este en pantalla)
+    if (playing_) {
+        if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
+            StopPlayback("Pausada (asistente)");  // el asistente habla o escucha
+        } else if (reconnect_in_ > 0 && --reconnect_in_ == 0) {
+            SetStatus("Conectando...");
+            SendCmd(1, cur_source_, cur_title_);
+        }
+    }
+
+    if (!visible_) return;
     RefreshClock();
     if (tick_count_ % 5 == 0) UpdateStatusIcons();
+}
+
+// ---------------------------------------------------------------------------
+// Reproduccion de emisoras y archivos
+// ---------------------------------------------------------------------------
+
+void Radio::EnsurePlayer() {
+    if (player_ready_) return;
+    player_ready_ = true;
+
+    Mp3Player::Callbacks cb;
+    cb.on_started = [this](const std::string&) {
+        retries_ = 0;
+        SetStatus(is_file_ ? "Reproduciendo archivo" : "Sonando");
+    };
+    cb.on_error = [this](const char* status, const char* message) {
+        ESP_LOGW(TAG, "Error de audio: %s - %s", status, message);
+        if (playing_ && !is_file_ && retries_ < 5) {
+            retries_++;
+            reconnect_in_ = 3;
+            SetStatus("Reconectando...");
+        } else {
+            playing_ = false;
+            g_external_audio_active = false;
+            SetStatus("Error de conexion");
+        }
+    };
+    cb.on_finished = [this]() {
+        if (!playing_) return;
+        if (is_file_) {
+            playing_ = false;
+            g_external_audio_active = false;
+            SetStatus("Fin del archivo");
+        } else if (retries_ < 5) {
+            retries_++;
+            reconnect_in_ = 3;
+            SetStatus("Reconectando...");
+        } else {
+            playing_ = false;
+            g_external_audio_active = false;
+            SetStatus("Emision cortada");
+        }
+    };
+    Mp3Player::GetInstance().Initialize(&g_output, &g_http_factory, cb);
+}
+
+void Radio::CmdTask(void*) {
+    Radio& r = Radio::GetInstance();
+    Cmd c;
+    for (;;) {
+        if (xQueueReceive((QueueHandle_t)r.cmd_q_, &c, portMAX_DELAY) != pdTRUE) continue;
+        r.EnsurePlayer();
+        if (c.type == 1) {
+            std::string err;
+            if (!Mp3Player::GetInstance().Play(c.url, c.title, &err)) {
+                r.playing_ = false;
+                g_external_audio_active = false;
+                r.SetStatus(("Error: " + err).c_str());
+            }
+        } else {
+            Mp3Player::GetInstance().Stop();
+            g_external_audio_active = false;
+        }
+    }
+}
+
+void Radio::SendCmd(int type, const std::string& url, const std::string& title) {
+    if (!cmd_q_) return;
+    Cmd c;
+    memset(&c, 0, sizeof(c));
+    c.type = type;
+    snprintf(c.url, sizeof(c.url), "%s", url.c_str());
+    snprintf(c.title, sizeof(c.title), "%s", title.c_str());
+    xQueueSend((QueueHandle_t)cmd_q_, &c, 0);
+}
+
+void Radio::SetStatus(const char* text) {
+    if (!display_) return;
+    DisplayLockGuard lock(display_);
+    status_ = text;
+    if (np_status_) SetLabel(np_status_, status_.c_str());
+}
+
+void Radio::StartPlayback(const std::string& source, const std::string& title, bool is_file) {
+    if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
+        SetStatus("Asistente ocupado");
+        return;
+    }
+    cur_source_ = source;
+    cur_title_ = title;
+    is_file_ = is_file;
+    retries_ = 0;
+    reconnect_in_ = 0;
+    playing_ = true;
+    g_external_audio_active = true;
+    SetStatus("Conectando...");
+    SendCmd(1, source, title);
+    RefreshNow();
+}
+
+void Radio::StopPlayback(const char* status) {
+    playing_ = false;
+    reconnect_in_ = 0;
+    SendCmd(0);
+    SetStatus(status);
+    RefreshNow();
+}
+
+void Radio::StartStation() {
+    if (selected_ < 0 || selected_ >= (int)stations_.size()) return;
+    const Station& s = stations_[selected_];
+    StartPlayback(s.url, s.name, false);
+}
+
+// Barras del visualizador: suben con el volumen del sonido y bajan poco a poco
+void Radio::BarsTick() {
+    if (!root_ || !visible_) return;
+    for (int i = 0; i < 16; i++) {
+        int target = 4;
+        if (playing_) target = 4 + (int)g_levels[i].load() * 24 / 130;
+        target = std::min(28, target);
+        bar_h_[i] = target > bar_h_[i] ? target : std::max(4, bar_h_[i] - 3);
+        lv_obj_set_size(bars_[i], 8, bar_h_[i]);
+        lv_obj_set_y(bars_[i], 102 - bar_h_[i]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -355,18 +660,25 @@ void Radio::OnSdRow(int idx) {
         return;
     }
 
-    // Archivo: por ahora solo se muestra la informacion
-    struct stat st;
+    // Archivo: los MP3 se reproducen; del resto solo se muestra la informacion
     const std::string full = sd_path_ + "/" + en.name;
-    char buf[160];
-    if (stat(full.c_str(), &st) == 0) {
-        const char kind = FileKind(en.name);
-        snprintf(buf, sizeof(buf), "%s - %u KB%s", en.name.c_str(), (unsigned)(st.st_size / 1024),
-                 kind == 'A' ? " (audio: se podra reproducir en la etapa 3)"
-                 : kind == 'V' ? " (video: etapa 4)" : "");
-    } else {
-        snprintf(buf, sizeof(buf), "%s", en.name.c_str());
+    const char kind = FileKind(en.name);
+    std::string lower = en.name;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return (char)tolower(c); });
+    const bool is_mp3 = lower.size() > 4 && lower.compare(lower.size() - 4, 4, ".mp3") == 0;
+
+    char buf[200];
+    if (is_mp3) {
+        snprintf(buf, sizeof(buf), "Reproduciendo: %s", en.name.c_str());
+        sd_msg_ = buf;
+        SetLabel(sd_info_, sd_msg_.c_str());
+        StartPlayback(full, en.name, true);
+        return;
     }
+    snprintf(buf, sizeof(buf), "%s - %s", en.name.c_str(),
+             kind == 'A' ? "por ahora solo se reproduce MP3"
+             : kind == 'V' ? "video: etapa 4" : "archivo no reproducible");
     sd_msg_ = buf;
     SetLabel(sd_info_, sd_msg_.c_str());
 }
@@ -443,7 +755,7 @@ void Radio::BuildUI() {
     np_name_ = MakeLabel(np, "", 0xFFFFFF, LV_ALIGN_TOP_LEFT, 10, 24, 170, true);
     np_status_ = MakeLabel(np, "", 0xFFE066, LV_ALIGN_TOP_LEFT, 10, 60, 170, true);
     for (int i = 0; i < 16; i++) {
-        bars_[i] = Box(np, 10 + i * 11, 96, 8, 4, C(0x2EA8F0), 2);
+        bars_[i] = Box(np, 10 + i * 11, 98, 8, 4, C(0x2EA8F0), 2);
     }
 
     MakeButton(root_, 20, 238, 190, 54, 0x8B5CF6, 14, "PLAY / STOP", 3, 0xFFFFFF);
@@ -501,13 +813,16 @@ void Radio::RefreshVolume() {
     SetLabel(vol_lbl_, buf);
     lv_obj_set_width(vol_fill_, std::max(2, (190 * volume_) / 100));
     lv_obj_set_style_bg_color(mute_btn_, C(muted_ ? 0xE53935 : 0x2EA8F0), 0);
+    g_gain = muted_ ? 0 : (volume_ * 256) / 100;
 }
 
 void Radio::RefreshNow() {
-    if (selected_ >= 0 && selected_ < (int)stations_.size()) {
+    if (playing_ && is_file_) {
+        SetLabel(np_name_, cur_title_.c_str());
+    } else if (selected_ >= 0 && selected_ < (int)stations_.size()) {
         SetLabel(np_name_, stations_[selected_].name.c_str());
     }
-    SetLabel(np_status_, playing_ ? "Sin audio aun (etapa 1)" : "Detenido");
+    SetLabel(np_status_, status_.empty() ? "Detenido" : status_.c_str());
 }
 
 void Radio::RefreshClock() {
@@ -571,6 +886,7 @@ void Radio::HandleButton(int id) {
     }
     if (id >= 100 && id < 100 + kMaxStations) {  // emisora
         SelectStation(id - 100);
+        if (playing_ && !is_file_) StartStation();  // cambia de emisora al instante
         return;
     }
 
@@ -583,8 +899,11 @@ void Radio::HandleButton(int id) {
             RefreshVolume();
             break;
         case 3:  // play / stop
-            playing_ = !playing_;
-            RefreshNow();
+            if (playing_) {
+                StopPlayback("Detenido");
+            } else {
+                StartStation();
+            }
             break;
         case 4:
             volume_ = std::max(0, volume_ - 10);
