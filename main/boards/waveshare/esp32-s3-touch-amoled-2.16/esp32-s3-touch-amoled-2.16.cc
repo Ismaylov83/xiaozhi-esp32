@@ -182,7 +182,8 @@ private:
             GetBacklight()->RestoreBrightness(); });
         power_save_timer_->OnShutdownRequest([this](){
             // En modo mascota o agenda la placa no se apaga sola
-            if (!Tamagotchi::GetInstance().IsVisible() && !Agenda::GetInstance().IsVisible()) {
+            if (!Tamagotchi::GetInstance().IsVisible() && !Agenda::GetInstance().IsVisible() &&
+                !Agenda::GetInstance().HasPendingReminders()) {
                 pmic_->PowerOff();
             } });
         power_save_timer_->SetEnabled(true);
@@ -268,6 +269,10 @@ private:
         auto& agenda = Agenda::GetInstance();
         agenda.SetActivityCallback([this]() {
             power_save_timer_->WakeUp();
+        });
+        agenda.SetBatteryProvider([this](int& level, bool& charging) {
+            bool discharging = false;
+            return GetBatteryLevel(level, charging, discharging);
         });
         agenda.Init(display_);
     }
