@@ -2,7 +2,6 @@
 #include "application.h"
 #include "board.h"
 #include "display/display.h"
-#include "mp3_player.h"
 
 #include <esp_http_client.h>
 #if __has_include(<esp_crt_bundle.h>)
@@ -10,7 +9,9 @@
 #define RADIO_HAVE_CRT_BUNDLE 1
 #endif
 #include <freertos/FreeRTOS.h>
+#include <esp_heap_caps.h>
 #include <freertos/queue.h>
+#include <freertos/ringbuf.h>
 #include <freertos/task.h>
 
 #include <driver/sdspi_host.h>
@@ -21,6 +22,10 @@
 #include <nvs.h>
 #include <nvs_flash.h>
 #include <sdmmc_cmd.h>
+
+extern "C" {
+#include "mp3dec.h"
+}
 
 #include <algorithm>
 #include <dirent.h>
@@ -172,22 +177,19 @@ char FileKind(const std::string& name) {
 }
 
 // ---------------------------------------------------------------------------
-// Conexion con el audio de xiaozhi y con internet / la SD
+// Audio: altavoz de xiaozhi, internet / SD y decodificador MP3
 // ---------------------------------------------------------------------------
-
-using namespace mydazy;
 
 std::atomic<int> g_gain{179};  // volumen de la radio, 0..256 (256 = sin cambio)
 std::atomic<uint8_t> g_levels[16];  // niveles para las barras
 
-// Envia el sonido ya decodificado al altavoz de xiaozhi
-class CodecOutput : public IAudioOutput {
+// Altavoz de xiaozhi
+class CodecOutput {
 public:
-    int output_sample_rate() const override { return Codec()->output_sample_rate(); }
-    int output_channels() const override { return Codec()->output_channels(); }
-    bool output_enabled() const override { return Codec()->output_enabled(); }
-    void EnableOutput(bool enable) override { Codec()->EnableOutput(enable); }
-    void OutputData(std::vector<int16_t>& pcm) override {
+    int Rate() { return Codec()->output_sample_rate(); }
+
+    // pcm: mono a la frecuencia del codec
+    void Write(std::vector<int16_t>& pcm) {
         const int gain = g_gain.load();
         if (gain != 256) {
             for (auto& s : pcm) s = (int16_t)(((int)s * gain) >> 8);
@@ -205,29 +207,32 @@ public:
                 g_levels[b].store((uint8_t)std::min(255, peak >> 6));
             }
         }
-        Codec()->OutputData(pcm);
+        auto* codec = Codec();
+        if (!codec->output_enabled()) codec->EnableOutput(true);
+        if (codec->output_channels() == 2) {
+            std::vector<int16_t> st(n * 2);
+            for (size_t i = 0; i < n; i++) st[2 * i] = st[2 * i + 1] = pcm[i];
+            codec->OutputData(st);
+        } else {
+            codec->OutputData(pcm);
+        }
     }
 
 private:
     static auto* Codec() { return Board::GetInstance().GetAudioCodec(); }
 };
 
-// Cliente HTTP para el reproductor. Tambien lee archivos de la SD (rutas /sdcard/...).
-class RadioHttp : public IHttpClient {
+// Cliente HTTP. Tambien lee archivos de la SD (rutas /sdcard/...).
+class RadioHttp {
 public:
-    ~RadioHttp() override { Close(); }
+    ~RadioHttp() { Close(); }
 
-    bool Open(const std::string& method, const std::string& url) override {
+    bool Open(const std::string& url) {
         Close();
         if (url.rfind("/sdcard/", 0) == 0 || url.rfind("file://", 0) == 0) {
             const std::string path = url.rfind("file://", 0) == 0 ? url.substr(7) : url;
             file_ = fopen(path.c_str(), "rb");
-            if (!file_) return false;
-            fseek(file_, 0, SEEK_END);
-            length_ = (size_t)ftell(file_);
-            fseek(file_, 0, SEEK_SET);
-            status_ = 200;
-            return true;
+            return file_ != nullptr;
         }
 
         std::string cur = url;
@@ -242,20 +247,18 @@ public:
 #endif
             h_ = esp_http_client_init(&cfg);
             if (!h_) return false;
-            esp_http_client_set_method(h_, method == "POST" ? HTTP_METHOD_POST : HTTP_METHOD_GET);
+            esp_http_client_set_method(h_, HTTP_METHOD_GET);
             esp_http_client_set_header(h_, "Icy-MetaData", "0");
             esp_http_client_set_header(h_, "User-Agent", "Mozilla/5.0 (ESP32 Radio)");
             if (esp_http_client_open(h_, 0) != ESP_OK) {
                 Close();
                 return false;
             }
-            const int64_t len = esp_http_client_fetch_headers(h_);
-            if (len < 0) {
+            if (esp_http_client_fetch_headers(h_) < 0) {
                 Close();
                 return false;
             }
             status_ = esp_http_client_get_status_code(h_);
-            length_ = (size_t)len;
             if (status_ == 301 || status_ == 302 || status_ == 303 || status_ == 307 ||
                 status_ == 308) {
                 char* loc = nullptr;
@@ -272,16 +275,16 @@ public:
         return false;
     }
 
-    int GetStatusCode() override { return status_; }
-    size_t GetBodyLength() override { return length_; }
+    bool IsFile() const { return file_ != nullptr; }
+    int StatusCode() const { return file_ ? 200 : status_; }
 
-    int Read(char* buf, size_t size) override {
+    int Read(uint8_t* buf, size_t size) {
         if (file_) return (int)fread(buf, 1, size, file_);
         if (!h_) return -1;
-        return esp_http_client_read(h_, buf, (int)size);
+        return esp_http_client_read(h_, (char*)buf, (int)size);
     }
 
-    void Close() override {
+    void Close() {
         if (file_) {
             fclose(file_);
             file_ = nullptr;
@@ -293,30 +296,260 @@ public:
         }
     }
 
-    void SetTimeout(int ms) override { timeout_ms_ = ms; }
+    void SetTimeout(int ms) { timeout_ms_ = ms; }
 
 private:
     esp_http_client_handle_t h_ = nullptr;
     FILE* file_ = nullptr;
     int status_ = 0;
-    size_t length_ = 0;
     int timeout_ms_ = 10000;
 };
 
-class RadioHttpFactory : public IHttpFactory {
-public:
-    std::unique_ptr<IHttpClient> CreateHttp() override { return std::make_unique<RadioHttp>(); }
-};
-
 CodecOutput g_output;
-RadioHttpFactory g_http_factory;
 
-// Orden para la tarea que arranca y para la reproduccion (Play/Stop pueden tardar)
-struct Cmd {
-    int type;  // 1 = reproducir, 0 = parar
-    char url[300];
-    char title[64];
+// Reproductor MP3 en streaming:
+//   tarea 1: descarga (internet o archivo) -> anillo de 96 KB en PSRAM
+//   tarea 2: anillo -> decodifica (Helix) -> mono -> frecuencia del codec -> altavoz
+// Cada reproduccion es una "sesion" independiente: parar o cambiar de emisora no espera
+// a nadie; las tareas viejas acaban solas y liberan su memoria.
+class Mp3Stream {
+public:
+    std::function<void()> on_started;
+    std::function<void(const char*)> on_error;
+    std::function<void()> on_finished;
+
+    bool Play(const std::string& url, std::string* err) {
+        Stop();
+        auto s = std::make_shared<Session>();
+        s->owner = this;
+        s->url = url;
+        s->ring = xRingbufferCreateWithCaps(kRingSize, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
+        if (!s->ring) {
+            if (err) *err = "sin memoria";
+            return false;
+        }
+        cur_ = s;
+        if (xTaskCreate(DownloadEntry, "mp3_dl", 10240, new std::shared_ptr<Session>(s), 4,
+                        nullptr) != pdPASS) {
+            Stop();
+            if (err) *err = "no se pudo crear la tarea de descarga";
+            return false;
+        }
+        if (xTaskCreate(DecodeEntry, "mp3_dec", 10240, new std::shared_ptr<Session>(s), 6,
+                        nullptr) != pdPASS) {
+            Stop();
+            if (err) *err = "no se pudo crear la tarea de audio";
+            return false;
+        }
+        return true;
+    }
+
+    void Stop() {
+        if (cur_) {
+            cur_->silent = true;
+            cur_->abort = true;
+            cur_.reset();
+        }
+    }
+
+private:
+    static constexpr size_t kRingSize = 96 * 1024;
+    static constexpr int kInBuf = 8192;
+
+    struct Session {
+        Mp3Stream* owner = nullptr;
+        RingbufHandle_t ring = nullptr;
+        std::string url;
+        std::atomic<bool> abort{false};
+        std::atomic<bool> silent{false};
+        std::atomic<bool> done{false};
+        std::atomic<bool> failed{false};
+        ~Session() {
+            if (ring) vRingbufferDeleteWithCaps(ring);
+        }
+    };
+
+    void Fail(Session* s, const char* msg) {
+        bool expected = false;
+        if (s->failed.compare_exchange_strong(expected, true)) {
+            s->abort = true;
+            if (!s->silent && on_error) on_error(msg);
+        }
+    }
+
+    static void DownloadEntry(void* arg) {
+        auto* sp = static_cast<std::shared_ptr<Session>*>(arg);
+        std::shared_ptr<Session> s = *sp;
+        delete sp;
+        s->owner->DownloadLoop(s.get());
+        s.reset();
+        vTaskDelete(nullptr);
+    }
+
+    static void DecodeEntry(void* arg) {
+        auto* sp = static_cast<std::shared_ptr<Session>*>(arg);
+        std::shared_ptr<Session> s = *sp;
+        delete sp;
+        s->owner->DecodeLoop(s.get());
+        s.reset();
+        vTaskDelete(nullptr);
+    }
+
+    void DownloadLoop(Session* s) {
+        RadioHttp http;
+        http.SetTimeout(8000);
+        uint8_t* buf = (uint8_t*)heap_caps_malloc(2048, MALLOC_CAP_SPIRAM);
+        if (!buf) {
+            Fail(s, "sin memoria");
+            return;
+        }
+        if (!http.Open(s->url)) {
+            Fail(s, "no se pudo conectar");
+        } else if (http.StatusCode() != 200) {
+            Fail(s, "el servidor no respondio bien");
+        } else {
+            int zeros = 0;
+            while (!s->abort) {
+                const int n = http.Read(buf, 2048);
+                if (n < 0) {
+                    Fail(s, "conexion perdida");
+                    break;
+                }
+                if (n == 0) {
+                    if (http.IsFile()) break;  // fin del archivo
+                    if (++zeros > 40) {
+                        Fail(s, "emision cortada");
+                        break;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    continue;
+                }
+                zeros = 0;
+                bool sent = false;
+                while (!sent && !s->abort) {
+                    sent = xRingbufferSend(s->ring, buf, (size_t)n, pdMS_TO_TICKS(200)) == pdTRUE;
+                }
+            }
+            if (!s->failed) s->done = true;  // el flujo termino
+        }
+        heap_caps_free(buf);
+    }
+
+    void DecodeLoop(Session* s) {
+        HMP3Decoder dec = MP3InitDecoder();
+        uint8_t* in = (uint8_t*)heap_caps_malloc(kInBuf, MALLOC_CAP_SPIRAM);
+        int16_t* pcm = (int16_t*)heap_caps_malloc(2304 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+        if (!dec || !in || !pcm) {
+            Fail(s, "sin memoria para decodificar");
+        } else {
+            int bytes_in = 0;
+            bool started = false;
+            int bad = 0;
+            float pos = 0.0f;
+            int16_t last = 0;
+            std::vector<int16_t> w, out;
+
+            while (!s->abort) {
+                bool ring_empty = false;
+                if (bytes_in < kInBuf - 2048) {  // hay hueco: rellenar desde el anillo
+                    size_t got = 0;
+                    void* item = xRingbufferReceiveUpTo(s->ring, &got, pdMS_TO_TICKS(s->done ? 10 : 100),
+                                                        (size_t)(kInBuf - bytes_in));
+                    if (item) {
+                        memcpy(in + bytes_in, item, got);
+                        bytes_in += (int)got;
+                        vRingbufferReturnItem(s->ring, item);
+                    } else if (s->done) {
+                        ring_empty = true;
+                    }
+                }
+                if (ring_empty && bytes_in < 4) break;      // todo reproducido
+                if (bytes_in < 1800 && !s->done) continue;  // falta un frame completo
+
+                uint8_t* rp = in;
+                int left = bytes_in;
+                const int off = MP3FindSyncWord(rp, left);
+                if (off < 0) {
+                    bytes_in = 0;
+                    continue;
+                }
+                rp += off;
+                left -= off;
+                uint8_t* frame_start = rp;
+
+                const int err = MP3Decode(dec, &rp, &left, pcm, 0);
+                if (err == ERR_MP3_NONE) {
+                    bad = 0;
+                    MP3FrameInfo fi;
+                    MP3GetLastFrameInfo(dec, &fi);
+                    if (fi.samprate > 0 && fi.nChans > 0 && fi.outputSamps > 0) {
+                        const int ch = fi.nChans;
+                        const int n = fi.outputSamps / ch;
+                        // mono con una muestra extra al principio (la ultima del frame anterior)
+                        w.resize((size_t)n + 1);
+                        w[0] = last;
+                        for (int i = 0; i < n; i++) {
+                            w[(size_t)i + 1] =
+                                ch == 2 ? (int16_t)(((int)pcm[2 * i] + (int)pcm[2 * i + 1]) / 2)
+                                        : pcm[i];
+                        }
+                        // pasa a la frecuencia del codec (interpolacion lineal)
+                        int dst = g_output.Rate();
+                        if (dst <= 0) dst = 24000;
+                        const float step = (float)fi.samprate / (float)dst;
+                        out.clear();
+                        while (pos < (float)n) {
+                            const int i = (int)pos;
+                            const float f = pos - (float)i;
+                            out.push_back((int16_t)((float)w[i] + (float)(w[i + 1] - w[i]) * f));
+                            pos += step;
+                        }
+                        pos -= (float)n;
+                        last = w[(size_t)n];
+
+                        if (!started) {
+                            started = true;
+                            if (!s->silent && on_started) on_started();
+                        }
+                        if (!out.empty()) g_output.Write(out);
+                    }
+                } else if (err == ERR_MP3_INDATA_UNDERFLOW) {
+                    if (ring_empty || s->done) break;       // no hay mas datos
+                    if (bytes_in >= kInBuf - 2048) {        // sin hueco para rellenar: saltar un byte
+                        rp = frame_start + 1;
+                        left = (int)((in + bytes_in) - rp);
+                    }
+                } else if (err == ERR_MP3_MAINDATA_UNDERFLOW) {
+                    // normal en los primeros frames: el siguiente se decodifica bien
+                } else {
+                    rp = frame_start + 1;  // dato corrupto: saltar un byte
+                    left = (int)((in + bytes_in) - rp);
+                    if (!started && ++bad > 400) {
+                        Fail(s, "no es un MP3 valido");
+                        break;
+                    }
+                }
+
+                // quitar lo ya consumido
+                if (left < 0) left = 0;
+                memmove(in, rp, (size_t)left);
+                bytes_in = left;
+            }
+            if (!s->abort && s->done && !s->silent && on_finished) on_finished();
+        }
+        if (dec) MP3FreeDecoder(dec);
+        if (in) heap_caps_free(in);
+        if (pcm) heap_caps_free(pcm);
+        s->abort = true;  // que la descarga tambien termine
+    }
+
+    std::shared_ptr<Session> cur_;
 };
+
+Mp3Stream& Stream() {
+    static Mp3Stream s;
+    return s;
+}
 
 }  // namespace
 
@@ -416,13 +649,12 @@ void Radio::EnsurePlayer() {
     if (player_ready_) return;
     player_ready_ = true;
 
-    Mp3Player::Callbacks cb;
-    cb.on_started = [this](const std::string&) {
+    Stream().on_started = [this]() {
         retries_ = 0;
         SetStatus(is_file_ ? "Reproduciendo archivo" : "Sonando");
     };
-    cb.on_error = [this](const char* status, const char* message) {
-        ESP_LOGW(TAG, "Error de audio: %s - %s", status, message);
+    Stream().on_error = [this](const char* message) {
+        ESP_LOGW(TAG, "Error de audio: %s", message);
         if (playing_ && !is_file_ && retries_ < 5) {
             retries_++;
             reconnect_in_ = 3;
@@ -430,10 +662,10 @@ void Radio::EnsurePlayer() {
         } else {
             playing_ = false;
             g_external_audio_active = false;
-            SetStatus("Error de conexion");
+            SetStatus(message);
         }
     };
-    cb.on_finished = [this]() {
+    Stream().on_finished = [this]() {
         if (!playing_) return;
         if (is_file_) {
             playing_ = false;
@@ -449,7 +681,6 @@ void Radio::EnsurePlayer() {
             SetStatus("Emision cortada");
         }
     };
-    Mp3Player::GetInstance().Initialize(&g_output, &g_http_factory, cb);
 }
 
 void Radio::CmdTask(void*) {
@@ -460,13 +691,13 @@ void Radio::CmdTask(void*) {
         r.EnsurePlayer();
         if (c.type == 1) {
             std::string err;
-            if (!Mp3Player::GetInstance().Play(c.url, c.title, &err)) {
+            if (!Stream().Play(c.url, &err)) {
                 r.playing_ = false;
                 g_external_audio_active = false;
                 r.SetStatus(("Error: " + err).c_str());
             }
         } else {
-            Mp3Player::GetInstance().Stop();
+            Stream().Stop();
             g_external_audio_active = false;
         }
     }
