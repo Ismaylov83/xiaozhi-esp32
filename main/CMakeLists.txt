@@ -1221,6 +1221,7 @@ idf_component_register(SRCS ${SOURCES}
                         bt
                         fatfs
                         xiaozhi-fonts
+                        esp_http_client fatfs sdmmc esp_driver_sdspi esp_driver_spi
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 
