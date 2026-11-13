@@ -21,7 +21,7 @@ public:
     int GetVolume() const;
 
 private:
-    bool playing_ = false;
+    bool playing_ = true;
     int volume_ = 70;
     std::string current_url_;
 };
