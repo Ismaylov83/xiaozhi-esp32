@@ -1,7 +1,15 @@
 #include "agenda.h"
+#include "application.h"
 #include "display/display.h"
+#include "mcp_server.h"
+
+#if __has_include("assets/lang_config.h")
+#include "assets/lang_config.h"
+#define AGENDA_HAVE_SOUND 1
+#endif
 
 #include <esp_log.h>
+#include <esp_wifi.h>
 #include <nvs.h>
 #include <nvs_flash.h>
 
@@ -18,6 +26,7 @@ namespace {
 constexpr int kW = 480;
 constexpr int kH = 480;
 constexpr size_t kMaxEvents = 64;
+constexpr int kOy = 14;  // desplazamiento vertical del calendario y la columna derecha
 
 constexpr uint32_t kBg = 0x0E1424;
 constexpr uint32_t kPanel = 0x1A2238;
@@ -30,6 +39,7 @@ const lv_font_t* kFont = LV_FONT_DEFAULT;
 const char* kMonths[12] = {"Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
                            "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"};
 const char* kWeekdays[7] = {"Domingo", "Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado"};
+const char* kWdAbbr[7] = {"Dom", "Lun", "Mar", "Mie", "Jue", "Vie", "Sab"};
 const char* kWdShort[7] = {"L", "M", "X", "J", "V", "S", "D"};
 
 // Segmentos a b c d e f g (bit 0 a bit 6) de cada cifra
@@ -159,14 +169,17 @@ Agenda& Agenda::GetInstance() {
 void Agenda::Init(Display* display) {
     if (root_ || !display) return;
     display_ = display;
-    DisplayLockGuard lock(display_);
-    LoadEvents();
-    ReadClock();
-    view_y_ = today_y_;
-    view_m_ = today_m_;
-    BuildUI();
-    RefreshAll();
-    lv_timer_create(OnTimer, 1000, nullptr);
+    {
+        DisplayLockGuard lock(display_);
+        LoadEvents();
+        ReadClock();
+        view_y_ = today_y_;
+        view_m_ = today_m_;
+        BuildUI();
+        RefreshAll();
+        lv_timer_create(OnTimer, 1000, nullptr);
+    }
+    RegisterTools();
     ESP_LOGI(TAG, "Agenda lista (%u citas)", (unsigned)events_.size());
 }
 
@@ -221,6 +234,13 @@ void Agenda::SaveEvents() {
     nvs_close(h);
 }
 
+void Agenda::SortEvents() {
+    std::sort(events_.begin(), events_.end(), [](const Event& a, const Event& b) {
+        return EvKey(a.year, a.month, a.day, a.hour, a.minute) <
+               EvKey(b.year, b.month, b.day, b.hour, b.minute);
+    });
+}
+
 bool Agenda::HasEvents(int y, int m, int d) const {
     for (const Event& e : events_) {
         if (e.year == y && e.month == m && e.day == d) return true;
@@ -229,12 +249,11 @@ bool Agenda::HasEvents(int y, int m, int d) const {
 }
 
 void Agenda::SetTemperature(int celsius, bool valid) {
+    if (!display_) return;
+    DisplayLockGuard lock(display_);
     temp_c_ = celsius;
     temp_ok_ = valid;
-    if (visible_ && display_) {
-        DisplayLockGuard lock(display_);
-        RefreshClock();
-    }
+    if (visible_) RefreshClock();
 }
 
 void Agenda::SetVisible(bool visible) {
@@ -257,13 +276,20 @@ void Agenda::CloseAllPanels() {
     Show(day_panel_, false);
     Show(edit_panel_, false);
     Show(up_panel_, false);
+    Show(fc_panel_, false);
 }
 
 void Agenda::Tick() {
     if (!root_) return;
+    tick_count_++;
     const int oy = today_y_, om = today_m_, od = today_d_, oh = hour_, omin = min_;
     const bool ook = time_ok_;
     ReadClock();
+
+    // Los avisos funcionan aunque la agenda no este en pantalla
+    if (time_ok_) CheckAlarms();
+    AlarmTick();
+
     if (!visible_) return;
     if (time_ok_ && !ook) {  // acaba de llegar la hora
         view_y_ = today_y_;
@@ -276,6 +302,261 @@ void Agenda::Tick() {
         RefreshClock();
         UpdateNext();
     }
+    if (tick_count_ % 5 == 0) UpdateStatusIcons();
+}
+
+// ---------------------------------------------------------------------------
+// Avisos (alarma con sonido)
+// ---------------------------------------------------------------------------
+
+void Agenda::CheckAlarms() {
+    if (alarm_active_) return;
+    const int now = NowKey();
+    bool changed = false;
+    for (Event& e : events_) {
+        if (e.fired) continue;
+        const int key = EvKey(e.year, e.month, e.day, e.hour, e.minute);
+        if (key > now) continue;
+        e.fired = 1;
+        changed = true;
+        // Si la hora ya paso hace mas de 10 minutos no suena (cita antigua)
+        if (e.remind && now - key <= 10) {
+            StartAlarm(e);
+            break;
+        }
+    }
+    if (changed) {
+        SaveEvents();
+        UpdateAvisos();
+        if (visible_) {
+            RefreshCalendar();
+            UpdateNext();
+        }
+    }
+}
+
+void Agenda::StartAlarm(const Event& e) {
+    SetDigit(alarm_clk_[0], e.hour / 10);
+    SetDigit(alarm_clk_[1], e.hour % 10);
+    SetDigit(alarm_clk_[2], e.minute / 10);
+    SetDigit(alarm_clk_[3], e.minute % 10);
+    SetLabel(alarm_txt_, e.text);
+    alarm_active_ = true;
+    alarm_secs_ = 0;
+    Show(alarm_panel_, true);
+    Activity();
+    ESP_LOGI(TAG, "Aviso: %02d:%02d %s", e.hour, e.minute, e.text);
+}
+
+void Agenda::DismissAlarm() {
+    alarm_active_ = false;
+    Show(alarm_panel_, false);
+    UpdateAvisos();
+}
+
+void Agenda::AlarmTick() {
+    if (!alarm_active_) return;
+    alarm_secs_++;
+    lv_obj_set_style_bg_color(alarm_panel_, C((alarm_secs_ % 2) ? 0xB01E36 : 0x7A1020), 0);
+    if (alarm_secs_ % 2 == 1) Beep();
+    if (alarm_secs_ % 10 == 0) Activity();  // mantiene la pantalla encendida
+    if (alarm_secs_ >= 90) DismissAlarm();   // si nadie lo atiende, se apaga solo
+}
+
+void Agenda::Beep() {
+#ifdef AGENDA_HAVE_SOUND
+    Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
+#endif
+}
+
+// Verde: sin avisos pendientes. Rojo: hay algun aviso por sonar.
+void Agenda::UpdateAvisos() {
+    bool pending = false;
+    for (const Event& e : events_) {
+        if (e.remind && !e.fired) {
+            pending = true;
+            break;
+        }
+    }
+    pending_reminders_.store(pending);
+    if (avisos_btn_) lv_obj_set_style_bg_color(avisos_btn_, C(pending ? 0xE53935 : 0x2ECC71), 0);
+}
+
+void Agenda::UpdateStatusIcons() {
+    // WiFi
+    int bars = 0;
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        const int r = ap.rssi;
+        bars = r > -55 ? 4 : r > -65 ? 3 : r > -75 ? 2 : 1;
+    }
+    for (int i = 0; i < 4; i++) {
+        lv_obj_set_style_bg_color(wifi_bar_[i], C(i < bars ? 0xFFFFFF : kOff), 0);
+    }
+
+    // Bateria
+    int level = 0;
+    bool charging = false;
+    char buf[16];
+    if (battery_cb_ && battery_cb_(level, charging)) {
+        level = std::max(0, std::min(100, level));
+        lv_obj_set_width(bat_fill_, std::max(2, (32 * level) / 100));
+        const uint32_t col = charging ? 0x4DA3FF : level <= 15 ? 0xFF4D4D : level <= 35 ? 0xFFB020 : 0x3DDC84;
+        lv_obj_set_style_bg_color(bat_fill_, C(col), 0);
+        snprintf(buf, sizeof(buf), "%d%%", level);
+    } else {
+        snprintf(buf, sizeof(buf), "--");
+    }
+    SetLabel(bat_lbl_, buf);
+}
+
+// ---------------------------------------------------------------------------
+// Herramientas de voz (MCP) para xiaozhi
+// ---------------------------------------------------------------------------
+
+void Agenda::RefreshAfterChange() {
+    RefreshCalendar();
+    UpdateNext();
+    UpdateAvisos();
+    if (day_panel_ && !lv_obj_has_flag(day_panel_, LV_OBJ_FLAG_HIDDEN)) RefreshDayPanel();
+}
+
+std::string Agenda::AddEventApi(int y, int m, int d, int h, int mi, const std::string& text,
+                                bool remind) {
+    if (y < 2020 || y > 2100 || m < 1 || m > 12 || d < 1 || d > DaysInMonth(y, m) || h < 0 ||
+        h > 23 || mi < 0 || mi > 59) {
+        return "ERROR: invalid date or time";
+    }
+    DisplayLockGuard lock(display_);
+    if (events_.size() >= kMaxEvents) return "ERROR: the agenda is full (64 events)";
+
+    Event e;
+    memset(&e, 0, sizeof(e));
+    e.year = (uint16_t)y;
+    e.month = (uint8_t)m;
+    e.day = (uint8_t)d;
+    e.hour = (uint8_t)h;
+    e.minute = (uint8_t)mi;
+    e.remind = remind ? 1 : 0;
+    size_t n = std::min<size_t>(text.size(), sizeof(e.text) - 1);
+    while (n > 0 && n < text.size() && ((uint8_t)text[n] & 0xC0) == 0x80) n--;  // no cortar un caracter UTF-8
+    memcpy(e.text, text.data(), n);
+    if (e.text[0] == 0) snprintf(e.text, sizeof(e.text), "Cita");
+
+    const bool past = time_ok_ && EvKey(y, m, d, h, mi) <= NowKey();
+    e.fired = past ? 1 : 0;  // una cita en el pasado no suena
+
+    events_.push_back(e);
+    SortEvents();
+    SaveEvents();
+    RefreshAfterChange();
+
+    char buf[128];
+    snprintf(buf, sizeof(buf), "OK: added %04d-%02d-%02d %02d:%02d \"%s\"%s%s", y, m, d, h, mi,
+             e.text, remind ? " with sound reminder" : "", past ? " (this time is already in the past, it will not ring)" : "");
+    return buf;
+}
+
+std::string Agenda::ListEventsApi(int y, int m, int d) {
+    DisplayLockGuard lock(display_);
+    std::string out;
+    int n = 0;
+    char buf[96];
+    for (const Event& e : events_) {
+        if (e.year != y || e.month != m) continue;
+        if (d != 0 && e.day != d) continue;
+        if (n >= 20) break;
+        snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d %s%s\n", e.year, e.month, e.day,
+                 e.hour, e.minute, e.text, e.remind ? " (reminder)" : "");
+        out += buf;
+        n++;
+    }
+    if (n == 0) return "No events found for that date";
+    return out;
+}
+
+std::string Agenda::DeleteEventApi(int y, int m, int d, int h, int mi) {
+    DisplayLockGuard lock(display_);
+    for (size_t i = 0; i < events_.size(); i++) {
+        const Event& e = events_[i];
+        if (e.year == y && e.month == m && e.day == d && e.hour == h && e.minute == mi) {
+            char buf[96];
+            snprintf(buf, sizeof(buf), "OK: deleted \"%s\"", e.text);
+            events_.erase(events_.begin() + i);
+            SaveEvents();
+            RefreshAfterChange();
+            return buf;
+        }
+    }
+    return "ERROR: no event found at that exact date and time";
+}
+
+void Agenda::RegisterTools() {
+    auto& mcp = McpServer::GetInstance();
+
+    mcp.AddTool("self.agenda.get_date_time",
+                "Get the current local date, time and weekday of the device. "
+                "Call this first to work out words such as today, tomorrow or next Friday "
+                "before adding, reading or deleting agenda events.",
+                PropertyList(), [](const PropertyList&) -> ReturnValue {
+                    const time_t now = time(nullptr);
+                    if (now < 1700000000) return std::string("The device does not have the time yet");
+                    struct tm t;
+                    localtime_r(&now, &t);
+                    char buf[96];
+                    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d (%s)", t.tm_year + 1900,
+                             t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, kWeekdays[t.tm_wday]);
+                    return std::string(buf);
+                });
+
+    mcp.AddTool("self.agenda.add_event",
+                "Add an appointment or event to the agenda (calendar) of this device. "
+                "Use 24-hour time. If remind is true the device rings an alarm at that time. "
+                "Call self.agenda.get_date_time first to work out the exact date.",
+                PropertyList({Property("year", kPropertyTypeInteger, 2020, 2100),
+                              Property("month", kPropertyTypeInteger, 1, 12),
+                              Property("day", kPropertyTypeInteger, 1, 31),
+                              Property("hour", kPropertyTypeInteger, 0, 23),
+                              Property("minute", kPropertyTypeInteger, 0, 59),
+                              Property("text", kPropertyTypeString),
+                              Property("remind", kPropertyTypeBoolean, true)}),
+                [this](const PropertyList& properties) -> ReturnValue {
+                    return AddEventApi(properties["year"].value<int>(),
+                                       properties["month"].value<int>(),
+                                       properties["day"].value<int>(),
+                                       properties["hour"].value<int>(),
+                                       properties["minute"].value<int>(),
+                                       properties["text"].value<std::string>(),
+                                       properties["remind"].value<bool>());
+                });
+
+    mcp.AddTool("self.agenda.list_events",
+                "List the events of the agenda for a given day, or for a whole month if day is 0. "
+                "Call self.agenda.get_date_time first to work out the exact date.",
+                PropertyList({Property("year", kPropertyTypeInteger, 2020, 2100),
+                              Property("month", kPropertyTypeInteger, 1, 12),
+                              Property("day", kPropertyTypeInteger, 0, 0, 31)}),
+                [this](const PropertyList& properties) -> ReturnValue {
+                    return ListEventsApi(properties["year"].value<int>(),
+                                         properties["month"].value<int>(),
+                                         properties["day"].value<int>());
+                });
+
+    mcp.AddTool("self.agenda.delete_event",
+                "Delete an agenda event. The exact date and time of the event are required; "
+                "list the events first if you do not know them.",
+                PropertyList({Property("year", kPropertyTypeInteger, 2020, 2100),
+                              Property("month", kPropertyTypeInteger, 1, 12),
+                              Property("day", kPropertyTypeInteger, 1, 31),
+                              Property("hour", kPropertyTypeInteger, 0, 23),
+                              Property("minute", kPropertyTypeInteger, 0, 59)}),
+                [this](const PropertyList& properties) -> ReturnValue {
+                    return DeleteEventApi(properties["year"].value<int>(),
+                                          properties["month"].value<int>(),
+                                          properties["day"].value<int>(),
+                                          properties["hour"].value<int>(),
+                                          properties["minute"].value<int>());
+                });
 }
 
 // ---------------------------------------------------------------------------
@@ -321,17 +602,40 @@ void Agenda::BuildUI() {
     lv_obj_add_flag(root_, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(root_, LV_OBJ_FLAG_HIDDEN);
 
+    // --- Fila superior: wifi (izquierda), hora (centro), bateria (derecha) ---
+    for (int i = 0; i < 4; i++) {
+        const int h = 7 + i * 5;
+        wifi_bar_[i] = Box(root_, 60 + i * 8, 44 - h, 5, h, C(kOff), 1);
+    }
+    lv_obj_t* bat = Box(root_, 392, 26, 38, 18, C(kBg), 3);
+    lv_obj_set_style_border_width(bat, 2, 0);
+    lv_obj_set_style_border_color(bat, C(0xFFFFFF), 0);
+    lv_obj_set_style_border_opa(bat, LV_OPA_COVER, 0);
+    bat_fill_ = Box(root_, 395, 29, 32, 12, C(0x3DDC84), 2);
+    Box(root_, 430, 31, 3, 8, C(0xFFFFFF), 1);
+    bat_lbl_ = MakeLabel(root_, "", 0xFFFFFF, LV_ALIGN_TOP_LEFT, 338, 27, 50);
+    lv_obj_set_style_text_align(bat_lbl_, LV_TEXT_ALIGN_RIGHT, 0);
+
+    const int x0 = 162;
+    const int cy = 18;
+    MakeDigit(clk_[0], root_, x0, cy, 30, 56, 6, 0xFFFFFF);
+    MakeDigit(clk_[1], root_, x0 + 36, cy, 30, 56, 6, 0xFFFFFF);
+    colon_[0] = Circle(root_, x0 + 75, cy + 16, 7, C(0xFFFFFF));
+    colon_[1] = Circle(root_, x0 + 75, cy + 34, 7, C(0xFFFFFF));
+    MakeDigit(clk_[2], root_, x0 + 90, cy, 30, 56, 6, 0xFFFFFF);
+    MakeDigit(clk_[3], root_, x0 + 126, cy, 30, 56, 6, 0xFFFFFF);
+
     // --- Calendario del mes (izquierda) ---
-    MakeButton(root_, 24, 18, 40, 32, kPanel, 8, "<", 1, 0xFFFFFF);
-    MakeButton(root_, 236, 18, 40, 32, kPanel, 8, ">", 2, 0xFFFFFF);
-    title_ = MakeLabel(root_, "", 0xFFFFFF, LV_ALIGN_TOP_LEFT, 64, 26, 172);
+    MakeButton(root_, 20, 84 + kOy, 40, 30, kPanel, 8, "<", 1, 0xFFFFFF);
+    MakeButton(root_, 267, 84 + kOy, 40, 30, kPanel, 8, ">", 2, 0xFFFFFF);
+    title_ = MakeLabel(root_, "", 0xFFFFFF, LV_ALIGN_TOP_LEFT, 62, 92 + kOy, 203);
     for (int c = 0; c < 7; c++) {
-        MakeLabel(root_, kWdShort[c], c >= 5 ? 0xFF9A9A : 0x8FA3C8, LV_ALIGN_TOP_LEFT, 24 + c * 36,
-                  54, 34);
+        MakeLabel(root_, kWdShort[c], c >= 5 ? 0xFF9A9A : 0x8FA3C8, LV_ALIGN_TOP_LEFT, 20 + c * 41,
+                  118 + kOy, 39);
     }
     for (int i = 0; i < 42; i++) {
         const int r = i / 7, c = i % 7;
-        cell_[i] = Box(root_, 24 + c * 36, 74 + r * 36, 34, 32, C(kPanel), 8);
+        cell_[i] = Box(root_, 20 + c * 41, 138 + kOy + r * 37, 39, 34, C(kPanel), 8);
         lv_obj_add_flag(cell_[i], LV_OBJ_FLAG_CLICKABLE);
         lv_obj_set_style_border_color(cell_[i], C(0xFFD93D), 0);
         lv_obj_set_style_border_opa(cell_[i], LV_OPA_COVER, 0);
@@ -341,37 +645,41 @@ void Agenda::BuildUI() {
         lv_label_set_text(cell_lbl_[i], "");
         lv_obj_set_style_text_font(cell_lbl_[i], kFont, 0);
         lv_obj_center(cell_lbl_[i]);
-        cell_dot_[i] = Circle(cell_[i], 14, 25, 5, C(0xFF6B6B));
+        cell_dot_[i] = Circle(cell_[i], 17, 26, 5, C(0xFF6B6B));
         Show(cell_dot_[i], false);
     }
 
-    // --- Hora grande (derecha) ---
-    const int x0 = 290;
-    MakeDigit(clk_[0], root_, x0, 60, 30, 56, 6, 0xFFFFFF);
-    MakeDigit(clk_[1], root_, x0 + 36, 60, 30, 56, 6, 0xFFFFFF);
-    colon_[0] = Circle(root_, x0 + 75, 76, 7, C(0xFFFFFF));
-    colon_[1] = Circle(root_, x0 + 75, 94, 7, C(0xFFFFFF));
-    MakeDigit(clk_[2], root_, x0 + 90, 60, 30, 56, 6, 0xFFFFFF);
-    MakeDigit(clk_[3], root_, x0 + 126, 60, 30, 56, 6, 0xFFFFFF);
+    // --- Columna derecha: clima, fecha y avisos ---
+    // Zona tactil del clima (abre la prevision de la semana)
+    lv_obj_t* clima = Box(root_, 322, 100 + kOy, 116, 106, C(kBg), 12);
+    lv_obj_set_style_bg_opa(clima, LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(clima, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(clima, OnEvent, LV_EVENT_CLICKED, (void*)(intptr_t)5);
 
-    // --- Temperatura (donde el ejemplo ponia el 36) ---
-    MakeDigit(temp_[0], root_, 296, 140, 20, 36, 4, 0xFFD93D);
-    MakeDigit(temp_[1], root_, 322, 140, 20, 36, 4, 0xFFD93D);
-    MakeDigit(temp_[2], root_, 348, 140, 20, 36, 4, 0xFFD93D);
-    lv_obj_t* deg = Circle(root_, 376, 142, 9, C(kBg));
+    MakeDigit(temp_[0], root_, 330, 100 + kOy, 18, 32, 4, 0xFFD93D);
+    MakeDigit(temp_[1], root_, 352, 100 + kOy, 18, 32, 4, 0xFFD93D);
+    MakeDigit(temp_[2], root_, 374, 100 + kOy, 18, 32, 4, 0xFFD93D);
+    lv_obj_t* deg = Circle(root_, 398, 102 + kOy, 8, C(kBg));
     lv_obj_set_style_border_width(deg, 2, 0);
     lv_obj_set_style_border_color(deg, C(0xFFD93D), 0);
     lv_obj_set_style_border_opa(deg, LV_OPA_COVER, 0);
-    MakeLabel(root_, "C", 0xFFD93D, LV_ALIGN_TOP_LEFT, 390, 148);
+    MakeLabel(root_, "C", 0xFFD93D, LV_ALIGN_TOP_LEFT, 410, 107 + kOy);
 
-    // --- Fecha ---
-    date_lbl_ = MakeLabel(root_, "", 0xDDE6FF, LV_ALIGN_TOP_LEFT, 290, 196, 170);
+    // Nube (icono del clima; en la siguiente etapa cambiara segun el tiempo)
+    const lv_color_t cloud = C(0x8FA3C8);
+    Circle(root_, 340, 150 + kOy + 18, 24, cloud);
+    Circle(root_, 356, 150 + kOy + 6, 32, cloud);
+    Circle(root_, 382, 150 + kOy + 16, 26, cloud);
+    Box(root_, 352, 150 + kOy + 28, 52, 16, cloud, 8);
 
-    // --- Boton redondo: recordatorios ---
-    MakeButton(root_, 339, 262, 72, 72, 0xFF4D4D, LV_RADIUS_CIRCLE, "AVISOS", 3, 0xFFFFFF);
+    date_lbl_ = MakeLabel(root_, "", 0xDDE6FF, LV_ALIGN_TOP_LEFT, 322, 206 + kOy, 116);
 
-    next_lbl_ = MakeLabel(root_, "", 0xFFE066, LV_ALIGN_TOP_LEFT, 30, 352, 420);
-    MakeButton(root_, 40, 396, 90, 40, kPanel, 12, "HOY", 4, 0xFFFFFF);
+    avisos_btn_ = MakeButton(root_, 348, 268 + kOy, 64, 64, 0x2ECC71, LV_RADIUS_CIRCLE, "AVISOS", 3,
+                             0xFFFFFF);
+
+    // --- Parte baja: cita pendiente (izquierda) y HOY (derecha) ---
+    next_lbl_ = MakeLabel(root_, "", 0xFFE066, LV_ALIGN_TOP_LEFT, 20, 372 + kOy, 287);
+    MakeButton(root_, 330, 372 + kOy, 100, 38, kPanel, 12, "HOY", 4, 0xFFFFFF);
 
     // --- Panel del dia (agenda) ---
     day_panel_ = MakePanel(root_);
@@ -420,12 +728,36 @@ void Agenda::BuildUI() {
         lv_obj_set_style_text_align(up_lbl_[r], LV_TEXT_ALIGN_LEFT, 0);
     }
     MakeButton(up_panel_, 140, 410, 200, 48, kPanel, 14, "VOLVER", 40, 0xFFFFFF);
+
+    // --- Panel de la prevision de la semana (aun sin datos) ---
+    fc_panel_ = MakePanel(root_);
+    MakeLabel(fc_panel_, "Prevision de la semana", 0xFFFFFF, LV_ALIGN_TOP_MID, 0, 28, 380);
+    MakeLabel(fc_panel_, "Todavia no hay datos del clima.\nSe activara en la siguiente etapa.",
+              0x8FA3C8, LV_ALIGN_TOP_MID, 0, 180, 380);
+    MakeButton(fc_panel_, 140, 410, 200, 48, kPanel, 14, "VOLVER", 41, 0xFFFFFF);
+
+    // --- Aviso a pantalla completa (encima de todo, tambien en otros modos) ---
+    alarm_panel_ = Box(lv_layer_top(), 0, 0, kW, kH, C(0x7A1020), 0);
+    lv_obj_add_flag(alarm_panel_, LV_OBJ_FLAG_CLICKABLE);
+    Show(alarm_panel_, false);
+    MakeLabel(alarm_panel_, "AVISO DE LA AGENDA", 0xFFFFFF, LV_ALIGN_TOP_MID, 0, 70, 380);
+    const int ax = 128;
+    MakeDigit(alarm_clk_[0], alarm_panel_, ax, 110, 44, 80, 9, 0xFFFFFF);
+    MakeDigit(alarm_clk_[1], alarm_panel_, ax + 52, 110, 44, 80, 9, 0xFFFFFF);
+    Circle(alarm_panel_, ax + 106, 110 + 24, 12, C(0xFFFFFF));
+    Circle(alarm_panel_, ax + 106, 110 + 50, 12, C(0xFFFFFF));
+    MakeDigit(alarm_clk_[2], alarm_panel_, ax + 128, 110, 44, 80, 9, 0xFFFFFF);
+    MakeDigit(alarm_clk_[3], alarm_panel_, ax + 180, 110, 44, 80, 9, 0xFFFFFF);
+    alarm_txt_ = MakeLabel(alarm_panel_, "", 0xFFFFFF, LV_ALIGN_TOP_MID, 0, 226, 380);
+    MakeButton(alarm_panel_, 140, 320, 200, 64, 0xFFFFFF, 20, "ENTENDIDO", 50, 0x7A1020);
 }
 
 void Agenda::RefreshAll() {
     RefreshCalendar();
     RefreshClock();
     UpdateNext();
+    UpdateAvisos();
+    UpdateStatusIcons();
 }
 
 void Agenda::RefreshCalendar() {
@@ -463,8 +795,6 @@ void Agenda::RefreshClock() {
     } else {
         for (int i = 0; i < 4; i++) SetDigit(clk_[i], -1);
     }
-    Show(colon_[0], true);
-    Show(colon_[1], true);
 
     if (temp_ok_) {
         int a = temp_c_ < 0 ? -temp_c_ : temp_c_;
@@ -480,10 +810,10 @@ void Agenda::RefreshClock() {
 
     char buf[64];
     if (time_ok_) {
-        snprintf(buf, sizeof(buf), "%s\n%02d/%02d/%d",
-                 kWeekdays[Weekday(today_y_, today_m_, today_d_)], today_d_, today_m_, today_y_);
+        snprintf(buf, sizeof(buf), "%s %02d/%02d\n%d",
+                 kWdAbbr[Weekday(today_y_, today_m_, today_d_)], today_d_, today_m_, today_y_);
     } else {
-        snprintf(buf, sizeof(buf), "Sin hora\n(conecta al wifi)");
+        snprintf(buf, sizeof(buf), "Sin hora");
     }
     SetLabel(date_lbl_, buf);
 }
@@ -501,10 +831,10 @@ void Agenda::UpdateNext() {
         }
     }
     if (next) {
-        snprintf(buf, sizeof(buf), "Proxima: %02d/%02d %02d:%02d  %s", next->day, next->month,
-                 next->hour, next->minute, next->text);
+        snprintf(buf, sizeof(buf), "Cita pendiente: %02d/%02d %02d:%02d  %s", next->day,
+                 next->month, next->hour, next->minute, next->text);
     } else {
-        snprintf(buf, sizeof(buf), "No hay citas proximas");
+        snprintf(buf, sizeof(buf), "Sin citas pendientes");
     }
     SetLabel(next_lbl_, buf);
 }
@@ -614,27 +944,21 @@ void Agenda::SaveEvent() {
     e.hour = (uint8_t)edit_h_;
     e.minute = (uint8_t)edit_m_;
     e.remind = edit_remind_ ? 1 : 0;
-    const char* txt = edit_text_;
-    snprintf(e.text, sizeof(e.text), "%s", (txt && txt[0]) ? txt : "Cita");
+    snprintf(e.text, sizeof(e.text), "%s", edit_text_[0] ? edit_text_ : "Cita");
+    // Una cita en el pasado no debe sonar
+    e.fired = (time_ok_ && EvKey(view_y_, view_m_, sel_day_, edit_h_, edit_m_) <= NowKey()) ? 1 : 0;
     events_.push_back(e);
-    std::sort(events_.begin(), events_.end(), [](const Event& a, const Event& b) {
-        return EvKey(a.year, a.month, a.day, a.hour, a.minute) <
-               EvKey(b.year, b.month, b.day, b.hour, b.minute);
-    });
+    SortEvents();
     SaveEvents();
     Show(edit_panel_, false);
-    RefreshDayPanel();
-    RefreshCalendar();
-    UpdateNext();
+    RefreshAfterChange();
 }
 
 void Agenda::DeleteEvent(int idx) {
     if (idx < 0 || idx >= (int)events_.size()) return;
     events_.erase(events_.begin() + idx);
     SaveEvents();
-    RefreshDayPanel();
-    RefreshCalendar();
-    UpdateNext();
+    RefreshAfterChange();
 }
 
 void Agenda::OpenUpcoming() {
@@ -661,6 +985,10 @@ void Agenda::OpenUpcoming() {
 void Agenda::HandleButton(int id) {
     Activity();
 
+    if (id == 50) {  // ENTENDIDO en el aviso
+        DismissAlarm();
+        return;
+    }
     if (id >= 200 && id < 300) {  // tecla del teclado
         TypeKey(id);
         return;
@@ -702,6 +1030,9 @@ void Agenda::HandleButton(int id) {
             sel_day_ = 0;
             RefreshCalendar();
             break;
+        case 5:
+            Show(fc_panel_, true);
+            break;
         case 10:
             OpenEditor();
             break;
@@ -738,6 +1069,9 @@ void Agenda::HandleButton(int id) {
             break;
         case 40:
             Show(up_panel_, false);
+            break;
+        case 41:
+            Show(fc_panel_, false);
             break;
         default:
             break;
