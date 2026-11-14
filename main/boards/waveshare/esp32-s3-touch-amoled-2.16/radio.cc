@@ -69,10 +69,10 @@ struct DefaultStation {
 
 // Emisoras de serie (MP3 por http). Se pueden anadir mas desde la SD en la siguiente etapa.
 const DefaultStation kDefaultStations[] = {
-    {"Groove Salad", "Ambient", "http://ice1.somafm.com/groovesalad-128-mp3"},
-    {"Drone Zone", "Ambient", "http://ice1.somafm.com/dronezone-128-mp3"},
-    {"Secret Agent", "Lounge", "http://ice1.somafm.com/secretagent-128-mp3"},
-    {"Lush", "Chill", "http://ice1.somafm.com/lush-128-mp3"},
+    {"Groove Salad", "ReggaeParis", "https://www.radio.es/s/nrjreggae"},
+    {"Drone Zone", "ZonaRap Radio", "https://www.radio.es/s/zonarap"},
+    {"Secret Agent", "AFN Rota", "https://www.radio.es/s/afn360rota"},
+    {"Lush", "KISS FM", "https://tunein.com/radio/KISS-FM-(ESPA%C3%91A)-940-s6055/"},
     {"Space Station", "Electronica", "http://ice1.somafm.com/spacestation-128-mp3"},
     {"Indie Pop Rocks", "Indie", "http://ice1.somafm.com/indiepop-128-mp3"},
     {"Defcon Radio", "Hacker", "http://ice1.somafm.com/defcon-128-mp3"},
