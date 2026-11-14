@@ -219,7 +219,7 @@ public:
     }
 
 private:
-    static auto* Codec() { return Board::GetInstance().GetAudioCodec(); }
+    static AudioCodec* Codec() { return Board::GetInstance().GetAudioCodec(); }
 };
 
 // Cliente HTTP. Tambien lee archivos de la SD (rutas /sdcard/...).
@@ -550,6 +550,13 @@ Mp3Stream& Stream() {
     static Mp3Stream s;
     return s;
 }
+
+// Orden para la tarea que arranca y para la reproduccion (Play/Stop pueden tardar)
+struct Cmd {
+    int type;  // 1 = reproducir, 0 = parar
+    char url[300];
+    char title[64];
+};
 
 }  // namespace
 
@@ -1153,4 +1160,3 @@ void Radio::HandleButton(int id) {
             break;
     }
 }
-
