@@ -30,6 +30,7 @@ public:
     void HandleButton(int id);
     void RebuildSdList();
     void BarsTick();
+    void RegisterTools();
 
 private:
     static void CmdTask(void* arg);
@@ -74,6 +75,12 @@ private:
     void SendCmd(int type, const std::string& url = "", const std::string& title = "");
     void StartPlayback(const std::string& source, const std::string& title, bool is_file);
     void StartStation();
+    std::string VoiceStatus();
+    std::string VoiceList();
+    std::string VoicePlay(const std::string& station);
+    std::string VoiceStop();
+    std::string VoiceVolume(int volume);
+    std::string VoiceMute(bool mute);
     void StopPlayback(const char* status);
     void SetStatus(const char* text);
 
@@ -86,6 +93,9 @@ private:
 
     bool visible_ = false;
     std::atomic<bool> playing_{false};
+    bool pending_start_ = false;  // orden de voz: empezar cuando el asistente termine
+    bool resume_pending_ = false;  // se pauso por hablar con el asistente: volver a sonar
+    int idle_ticks_ = 0;
     bool is_file_ = false;
     bool player_ready_ = false;
     int retries_ = 0;
