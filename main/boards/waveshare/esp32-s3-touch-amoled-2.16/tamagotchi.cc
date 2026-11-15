@@ -263,10 +263,8 @@ void Tamagotchi::TryCatchUp() {
     if (!catchup_pending_) return;
     const time_t now = time(nullptr);
     if (now < 1700000000) return;  // el reloj aun no tiene la hora
-    // Espera a que la hora se sincronice por internet: antes puede estar desfasada
-    if (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && esp_timer_get_time() < 90LL * 1000000LL) {
-        return;
-    }
+    // Espera 90 s desde el arranque a que la hora se sincronice por internet: antes puede estar desfasada
+    if (esp_timer_get_time() < 90LL * 1000000LL) return;
     catchup_pending_ = false;
     if (st_.saved_unix > 0 && (uint32_t)now > st_.saved_unix) {
         uint32_t elapsed = (uint32_t)now - st_.saved_unix;
