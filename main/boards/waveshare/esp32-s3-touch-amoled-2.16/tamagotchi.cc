@@ -1,7 +1,11 @@
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#pragma GCC diagnostic ignored "-Wformat-overflow"
 #include "tamagotchi.h"
 #include "display/display.h"
+#include "mcp_server.h"
 
 #include <esp_log.h>
+#include <esp_netif_sntp.h>
 #include <esp_random.h>
 #include <esp_timer.h>
 #include <nvs.h>
@@ -38,7 +42,9 @@ constexpr uint32_t kChildSec = 24 * 3600;
 constexpr uint32_t kAdultSec = 72 * 3600;
 constexpr uint32_t kSeniorSec = 48 * 3600;
 constexpr uint32_t kDaySec = 24 * 3600;
-constexpr uint32_t kAwakeSec = 16 * 3600;   // 16 h despierto, 8 h dormido
+constexpr uint32_t kAwakeSec = 16 * 3600;   // sin hora: 16 h despierto, 8 h dormido
+constexpr int kSleepStartHour = 23;         // con hora: duerme de 23:00 a 07:00
+constexpr int kSleepEndHour = 7;
 constexpr uint32_t kHungerSec = 2400;       // 1 corazon de hambre cada 40 min
 constexpr uint32_t kHappySec = 3000;        // 1 corazon de felicidad cada 50 min
 constexpr uint32_t kPoopSec = 5400;         // una caca cada 90 min
@@ -47,7 +53,7 @@ constexpr uint32_t kSickCheckSec = 600;
 constexpr uint32_t kSickDeathSec = 4 * 3600;
 constexpr uint32_t kCallTimeoutSec = 900;
 constexpr uint32_t kSleepLightSec = 1800;
-constexpr uint32_t kMaxCatchUpSec = 10 * 3600;
+constexpr uint32_t kMaxCatchUpSec = 48 * 3600;
 constexpr uint32_t kSaveEverySec = 300;
 
 // Cambia esta fuente si el texto se ve pequeno (por ejemplo &lv_font_montserrat_20 si esta activada)
@@ -204,6 +210,7 @@ void Tamagotchi::Init(Display* display) {
     BuildUI();
     last_s_ = esp_timer_get_time() / 1000000;
     lv_timer_create(OnTimer, 250, nullptr);
+    RegisterTools();
     ESP_LOGI(TAG, "Tamagotchi listo (vivo=%d etapa=%d)", st_.alive, st_.stage);
 }
 
@@ -237,20 +244,43 @@ void Tamagotchi::Save() {
     nvs_close(h);
 }
 
+bool Tamagotchi::ShouldSleep() {
+    time_t t = 0;
+    if (sim_active_) {
+        t = sim_unix_;
+    } else if (TAMA_TIME_SCALE == 1) {
+        t = time(nullptr);
+    }
+    if (t >= 1700000000) {
+        struct tm lt;
+        localtime_r(&t, &lt);
+        return lt.tm_hour >= kSleepStartHour || lt.tm_hour < kSleepEndHour;
+    }
+    return (st_.age_sec % kDaySec) >= kAwakeSec;
+}
+
 void Tamagotchi::TryCatchUp() {
     if (!catchup_pending_) return;
     const time_t now = time(nullptr);
     if (now < 1700000000) return;  // el reloj aun no tiene la hora
+    // Espera a que la hora se sincronice por internet: antes puede estar desfasada
+    if (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && esp_timer_get_time() < 90LL * 1000000LL) {
+        return;
+    }
     catchup_pending_ = false;
     if (st_.saved_unix > 0 && (uint32_t)now > st_.saved_unix) {
         uint32_t elapsed = (uint32_t)now - st_.saved_unix;
         if (elapsed > kMaxCatchUpSec) elapsed = kMaxCatchUpSec;
         ESP_LOGI(TAG, "Recuperando %u s de tiempo apagado", (unsigned)elapsed);
+        sim_unix_ = now - (time_t)elapsed;  // reloj simulado: asi tambien duerme de noche
+        sim_active_ = true;
         while (elapsed > 0) {
             const uint32_t c = elapsed > 60 ? 60 : elapsed;
             Step(c);
+            sim_unix_ += (time_t)c;
             elapsed -= c;
         }
+        sim_active_ = false;
     }
 }
 
@@ -342,8 +372,8 @@ void Tamagotchi::Step(uint32_t dt) {
     }
     st_.age_sec += dt;
 
-    // Sueno: 16 h despierto y 8 h dormido, contando desde que nace
-    const bool want_sleep = (st_.age_sec % kDaySec) >= kAwakeSec;
+    // Sueno: de noche segun el reloj (o, sin hora, 16 h despierto y 8 h dormido)
+    const bool want_sleep = ShouldSleep();
     if (want_sleep != (st_.asleep != 0)) {
         st_.asleep = want_sleep ? 1 : 0;
         st_.sleep_light_sec = 0;
@@ -457,6 +487,88 @@ void Tamagotchi::Step(uint32_t dt) {
 // ---------------------------------------------------------------------------
 // Acciones del usuario
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Control por voz (herramientas para xiaozhi)
+// ---------------------------------------------------------------------------
+
+std::string Tamagotchi::DescribeStatus() {
+    DisplayLockGuard lock(display_);
+    if (!st_.alive) return "The pet is dead. Use the care action new_egg to start a new one.";
+    if (st_.stage == 0) return "The pet is still an egg and will hatch soon.";
+    const SpeciesInfo& sp = kSpecies[st_.species % kNumSpecies];
+    char buf[640];
+    snprintf(buf, sizeof(buf),
+             "%s, stage %s, age %ud %uh. Hunger hearts %d/4, happiness hearts %d/4. Weight %d, "
+             "discipline %d%%. Poops to clean: %d. %s%s%s%s",
+             sp.name, kStageNames[st_.stage], (unsigned)(st_.age_sec / kDaySec),
+             (unsigned)((st_.age_sec % kDaySec) / 3600), st_.hunger, st_.happy, st_.weight,
+             st_.discipline, st_.poop,
+             st_.sick ? "It is sick (needs medicine twice). " : "It is healthy. ",
+             st_.asleep ? "It is asleep (turn the lights off). " : "",
+             st_.lights_off ? "The lights are off. " : "",
+             st_.call == 2 ? "It is misbehaving (needs discipline)."
+             : st_.call == 1 ? "It is asking for attention."
+                             : "");
+    return buf;
+}
+
+std::string Tamagotchi::DoVoiceAction(const std::string& action) {
+    DisplayLockGuard lock(display_);
+    if (action == "new_egg") {
+        if (st_.alive) return "ERROR: the pet is alive; a new egg is only possible after it dies";
+        NewEgg();
+        RefreshUI();
+        return "OK: a new egg appeared";
+    }
+    if (!st_.alive) return "ERROR: the pet is dead. Use new_egg to start a new one.";
+
+    int id = -1;
+    if (action == "feed_meal") {
+        id = 10;
+    } else if (action == "feed_snack") {
+        id = 11;
+    } else if (action == "clean") {
+        id = 4;
+    } else if (action == "medicine") {
+        id = 3;
+    } else if (action == "discipline") {
+        id = 5;
+    } else if (action == "lights_on") {
+        if (!st_.lights_off) return "OK: the lights were already on";
+        id = 2;
+    } else if (action == "lights_off") {
+        if (st_.lights_off) return "OK: the lights were already off";
+        id = 2;
+    } else {
+        return "ERROR: unknown action";
+    }
+
+    msg_[0] = 0;
+    msg_frames_ = 0;
+    HandleButton(id);
+    return msg_[0] ? std::string(msg_) : std::string("OK: done");
+}
+
+void Tamagotchi::RegisterTools() {
+    auto& mcp = McpServer::GetInstance();
+
+    mcp.AddTool("self.pet.get_status",
+                "Get the state of the virtual pet (tamagotchi) shown on the device: species, age, "
+                "hunger, happiness, health and whether it is asleep.",
+                PropertyList(), [this](const PropertyList&) -> ReturnValue { return DescribeStatus(); });
+
+    mcp.AddTool("self.pet.care",
+                "Take care of the virtual pet. action must be one of: feed_meal (food, fills a hunger "
+                "heart), feed_snack (a treat, fills a happiness heart), clean (clean the poop), "
+                "medicine (needs two doses when it is sick), discipline (only works when it is "
+                "misbehaving), lights_off (needed so it can sleep), lights_on, new_egg (only after it "
+                "has died). The pet cannot eat while it is asleep: turn the lights off first.",
+                PropertyList({Property("action", kPropertyTypeString)}),
+                [this](const PropertyList& properties) -> ReturnValue {
+                    return DoVoiceAction(properties["action"].value<std::string>());
+                });
+}
 
 void Tamagotchi::Activity() {
     if (on_activity_) on_activity_();
@@ -1423,9 +1535,10 @@ void Tamagotchi::RefreshUI() {
         snprintf(stats, sizeof(stats), "Va a nacer pronto");
     } else {
         snprintf(name, sizeof(name), "%s - %s", sp.name, kStageNames[st_.stage]);
-        snprintf(stats, sizeof(stats), "Edad %ud %02uh   Peso %ug   Disc %u%%",
+        snprintf(stats, sizeof(stats), "Edad %ud %02uh %02um   Peso %ug   Disc %u%%",
                  (unsigned)(st_.age_sec / kDaySec), (unsigned)((st_.age_sec % kDaySec) / 3600),
-                 (unsigned)st_.weight, (unsigned)st_.discipline);
+                 (unsigned)((st_.age_sec % 3600) / 60), (unsigned)st_.weight,
+                 (unsigned)st_.discipline);
     }
     SetLabel(name_lbl_, name);
     SetLabel(stats_lbl_, stats);
