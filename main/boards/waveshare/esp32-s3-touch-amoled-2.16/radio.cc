@@ -1,7 +1,10 @@
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#pragma GCC diagnostic ignored "-Wformat-overflow"
 #include "radio.h"
 #include "application.h"
 #include "board.h"
 #include "display/display.h"
+#include "mcp_server.h"
 
 #include <esp_http_client.h>
 #if __has_include(<esp_crt_bundle.h>)
@@ -31,6 +34,7 @@ extern "C" {
 #include <dirent.h>
 #include <memory>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
@@ -601,6 +605,7 @@ void Radio::Init(Display* display) {
     xTaskCreate(CmdTask, "radio_cmd", 6144, nullptr, 5, nullptr);
     lv_timer_create(OnTimer, 1000, nullptr);
     lv_timer_create(OnBarsTimer, 120, nullptr);
+    RegisterTools();
     ESP_LOGI(TAG, "Radio lista (%u emisoras)", (unsigned)stations_.size());
 }
 
@@ -717,12 +722,23 @@ void Radio::Tick() {
     tick_count_++;
 
     // Control de la reproduccion (funciona aunque la radio no este en pantalla)
+    const bool idle = Application::GetInstance().GetDeviceState() == kDeviceStateIdle;
+    idle_ticks_ = idle ? idle_ticks_ + 1 : 0;
     if (playing_) {
-        if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
-            StopPlayback("Pausada (asistente)");  // el asistente habla o escucha
+        if (!idle) {
+            resume_pending_ = true;  // el asistente habla o escucha: pausa y vuelve despues
+            StopPlayback("Pausada (asistente)");
         } else if (reconnect_in_ > 0 && --reconnect_in_ == 0) {
             SetStatus("Conectando...");
             SendCmd(1, cur_source_, cur_title_);
+        }
+    } else if (idle && idle_ticks_ >= 2) {
+        if (pending_start_) {  // orden de voz pendiente
+            pending_start_ = false;
+            StartStation();
+        } else if (resume_pending_) {  // vuelve a sonar tras hablar con el asistente
+            resume_pending_ = false;
+            StartPlayback(cur_source_, cur_title_, is_file_);
         }
     }
 
@@ -841,6 +857,139 @@ void Radio::StartStation() {
     if (selected_ < 0 || selected_ >= (int)stations_.size()) return;
     const Station& s = stations_[selected_];
     StartPlayback(s.url, s.name, false);
+}
+
+// ---------------------------------------------------------------------------
+// Control por voz (herramientas para xiaozhi)
+// ---------------------------------------------------------------------------
+
+std::string Radio::VoiceStatus() {
+    DisplayLockGuard lock(display_);
+    const char* name = "none";
+    if (selected_ >= 0 && selected_ < (int)stations_.size()) name = stations_[selected_].name.c_str();
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "Radio %s. Source: %s. Status: %s. Volume: %d%%%s. Stations available: %d.",
+             playing_ ? "is playing" : "is stopped", (playing_ && is_file_) ? cur_title_.c_str() : name,
+             status_.empty() ? "stopped" : status_.c_str(), volume_, muted_ ? " (muted)" : "",
+             (int)stations_.size());
+    return buf;
+}
+
+std::string Radio::VoiceList() {
+    DisplayLockGuard lock(display_);
+    std::string out;
+    const int n = std::min((int)stations_.size(), kMaxStations);
+    for (int i = 0; i < n; i++) {
+        char line[256];
+        snprintf(line, sizeof(line), "%d: %s (%s)\n", i + 1, stations_[i].name.c_str(),
+                 stations_[i].genre.c_str());
+        out += line;
+    }
+    if (out.empty()) out = "No stations";
+    return out;
+}
+
+std::string Radio::VoicePlay(const std::string& station) {
+    DisplayLockGuard lock(display_);
+    const int n = std::min((int)stations_.size(), kMaxStations);
+    if (n == 0) return "ERROR: there are no stations";
+
+    int idx = selected_;
+    std::string q = station;
+    std::transform(q.begin(), q.end(), q.begin(), [](unsigned char c) { return (char)tolower(c); });
+    if (!q.empty()) {
+        if (q == "next" || q == "siguiente") {
+            idx = (selected_ + 1) % n;
+        } else if (q == "previous" || q == "anterior") {
+            idx = (selected_ + n - 1) % n;
+        } else {
+            char* end = nullptr;
+            const long num = strtol(q.c_str(), &end, 10);
+            if (end && *end == 0 && num >= 1 && num <= n) {
+                idx = (int)num - 1;
+            } else {
+                idx = -1;
+                for (int i = 0; i < n; i++) {
+                    std::string nm = stations_[i].name + " " + stations_[i].genre;
+                    std::transform(nm.begin(), nm.end(), nm.begin(),
+                                   [](unsigned char c) { return (char)tolower(c); });
+                    if (nm.find(q) != std::string::npos) {
+                        idx = i;
+                        break;
+                    }
+                }
+                if (idx < 0) return "ERROR: station not found. Use self.radio.list_stations to see the names";
+            }
+        }
+    }
+    SelectStation(idx);
+    resume_pending_ = false;
+    pending_start_ = true;  // empieza en cuanto el asistente termine de hablar
+    return "OK: will play " + stations_[idx].name + " as soon as the assistant finishes talking";
+}
+
+std::string Radio::VoiceStop() {
+    DisplayLockGuard lock(display_);
+    resume_pending_ = false;
+    pending_start_ = false;
+    if (playing_) StopPlayback("Detenido");
+    return "OK: radio stopped";
+}
+
+std::string Radio::VoiceVolume(int volume) {
+    DisplayLockGuard lock(display_);
+    volume_ = std::max(0, std::min(100, volume));
+    muted_ = false;
+    SaveSettings();
+    RefreshVolume();
+    char buf[64];
+    snprintf(buf, sizeof(buf), "OK: radio volume set to %d%%", volume_);
+    return buf;
+}
+
+std::string Radio::VoiceMute(bool mute) {
+    DisplayLockGuard lock(display_);
+    muted_ = mute;
+    RefreshVolume();
+    return mute ? "OK: radio muted" : "OK: radio unmuted";
+}
+
+void Radio::RegisterTools() {
+    auto& mcp = McpServer::GetInstance();
+
+    mcp.AddTool("self.radio.get_status",
+                "Get the state of the internet radio: whether it is playing, the current station, "
+                "the volume and how many stations are available.",
+                PropertyList(), [this](const PropertyList&) -> ReturnValue { return VoiceStatus(); });
+
+    mcp.AddTool("self.radio.list_stations",
+                "List the internet radio stations the device can play, numbered.", PropertyList(),
+                [this](const PropertyList&) -> ReturnValue { return VoiceList(); });
+
+    mcp.AddTool("self.radio.play",
+                "Play the internet radio. Optionally pass a station: a name or part of a name, its "
+                "number from list_stations, or the words next / previous. Without a station it plays "
+                "the currently selected one. The sound starts as soon as the assistant finishes talking.",
+                PropertyList({Property("station", kPropertyTypeString, std::string(""))}),
+                [this](const PropertyList& properties) -> ReturnValue {
+                    return VoicePlay(properties["station"].value<std::string>());
+                });
+
+    mcp.AddTool("self.radio.stop", "Stop the internet radio.", PropertyList(),
+                [this](const PropertyList&) -> ReturnValue { return VoiceStop(); });
+
+    mcp.AddTool("self.radio.set_volume", "Set the internet radio volume, from 0 to 100 percent.",
+                PropertyList({Property("volume", kPropertyTypeInteger, 0, 100)}),
+                [this](const PropertyList& properties) -> ReturnValue {
+                    return VoiceVolume(properties["volume"].value<int>());
+                });
+
+    mcp.AddTool("self.radio.set_mute", "Mute or unmute the internet radio without stopping it.",
+                PropertyList({Property("mute", kPropertyTypeBoolean)}),
+                [this](const PropertyList& properties) -> ReturnValue {
+                    return VoiceMute(properties["mute"].value<bool>());
+                });
 }
 
 // Barras del visualizador: suben con el volumen del sonido y bajan poco a poco
@@ -1230,6 +1379,8 @@ void Radio::HandleButton(int id) {
             RefreshVolume();
             break;
         case 3:  // play / stop
+            resume_pending_ = false;
+            pending_start_ = false;
             if (playing_) {
                 StopPlayback("Detenido");
             } else {
