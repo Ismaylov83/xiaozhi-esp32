@@ -8,12 +8,22 @@
 #define AGENDA_HAVE_SOUND 1
 #endif
 
+#include <cJSON.h>
+#include <esp_http_client.h>
 #include <esp_log.h>
+#include <esp_netif_sntp.h>
 #include <esp_wifi.h>
+#if __has_include(<esp_crt_bundle.h>)
+#include <esp_crt_bundle.h>
+#define AGENDA_HAVE_CRT_BUNDLE 1
+#endif
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <nvs.h>
 #include <nvs_flash.h>
 
 #include <algorithm>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +38,11 @@ constexpr int kH = 480;
 constexpr size_t kMaxEvents = 64;
 constexpr int kOy = 14;  // desplazamiento vertical del calendario y la columna derecha
 
+// Ciudad del clima y de la hora: El Puerto de Santa Maria (Cadiz)
+constexpr double kLat = 36.5939;
+constexpr double kLon = -6.2325;
+const char* const kTimeZone = "CET-1CEST,M3.5.0,M10.5.0/3";  // Europa/Madrid, con horario de verano
+
 constexpr uint32_t kBg = 0x0E1424;
 constexpr uint32_t kPanel = 0x1A2238;
 constexpr uint32_t kAccent = 0x3A8DDE;
@@ -37,7 +52,7 @@ constexpr uint32_t kOff = 0x1C2540;
 const lv_font_t* kFont = LV_FONT_DEFAULT;
 
 const char* kMonths[12] = {"Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
-                            "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"};
+                           "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"};
 const char* kWeekdays[7] = {"Domingo", "Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado"};
 const char* kWdAbbr[7] = {"Dom", "Lun", "Mar", "Mie", "Jue", "Vie", "Sab"};
 const char* kWdShort[7] = {"L", "M", "X", "J", "V", "S", "D"};
@@ -155,6 +170,49 @@ void BuildDate(int& y, int& m) {
     y = atoi(d + 7);
 }
 
+// ---- Clima (Open-Meteo, no necesita clave) ----
+
+esp_err_t HttpEvt(esp_http_client_event_t* e) {
+    if (e->event_id == HTTP_EVENT_ON_DATA && e->user_data) {
+        auto* s = static_cast<std::string*>(e->user_data);
+        if (s->size() + (size_t)e->data_len < 8192) {
+            s->append((const char*)e->data, (size_t)e->data_len);
+        }
+    }
+    return ESP_OK;
+}
+
+bool FetchUrl(const char* url, std::string* out) {
+    esp_http_client_config_t cfg = {};
+    cfg.url = url;
+    cfg.timeout_ms = 10000;
+    cfg.event_handler = HttpEvt;
+    cfg.user_data = out;
+#ifdef AGENDA_HAVE_CRT_BUNDLE
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+#endif
+    esp_http_client_handle_t h = esp_http_client_init(&cfg);
+    if (!h) return false;
+    const esp_err_t err = esp_http_client_perform(h);
+    const int status = esp_http_client_get_status_code(h);
+    esp_http_client_cleanup(h);
+    return err == ESP_OK && status == 200;
+}
+
+// 0 sol, 1 poco nuboso, 2 nublado, 3 lluvia, 4 nieve, 5 tormenta, 6 niebla
+int WeatherCat(int code) {
+    if (code <= 1) return 0;
+    if (code == 2) return 1;
+    if (code == 3) return 2;
+    if (code == 45 || code == 48) return 6;
+    if (code >= 95) return 5;
+    if ((code >= 71 && code <= 77) || code == 85 || code == 86) return 4;
+    return 3;  // llovizna, lluvia y chubascos
+}
+
+const char* kWxNames[7] = {"Despejado", "Poco nuboso", "Nublado", "Lluvia",
+                           "Nieve",     "Tormenta",    "Niebla"};
+
 }  // namespace
 
 Agenda& Agenda::GetInstance() {
@@ -169,6 +227,8 @@ Agenda& Agenda::GetInstance() {
 void Agenda::Init(Display* display) {
     if (root_ || !display) return;
     display_ = display;
+    setenv("TZ", kTimeZone, 1);  // hora de Madrid
+    tzset();
     {
         DisplayLockGuard lock(display_);
         LoadEvents();
@@ -180,6 +240,7 @@ void Agenda::Init(Display* display) {
         lv_timer_create(OnTimer, 1000, nullptr);
     }
     RegisterTools();
+    xTaskCreate(WeatherTask, "agenda_wx", 10240, nullptr, 3, nullptr);
     ESP_LOGI(TAG, "Agenda lista (%u citas)", (unsigned)events_.size());
 }
 
@@ -414,6 +475,154 @@ void Agenda::UpdateStatusIcons() {
 // Herramientas de voz (MCP) para xiaozhi
 // ---------------------------------------------------------------------------
 
+// Tarea que sincroniza la hora (internet) y descarga el clima cada 30 minutos
+void Agenda::WeatherTask(void*) {
+    Agenda& a = Agenda::GetInstance();
+    bool sntp_started = false;
+    for (;;) {
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {  // todavia sin wifi
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+        if (!sntp_started) {  // hora exacta por internet
+            sntp_started = true;
+            esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+            esp_netif_sntp_init(&cfg);
+        }
+
+        std::string body;
+        char url[400];
+        snprintf(url, sizeof(url),
+                 "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+                 "&current=temperature_2m,weather_code"
+                 "&daily=weather_code,temperature_2m_max,temperature_2m_min"
+                 "&timezone=Europe%%2FMadrid&forecast_days=7",
+                 kLat, kLon);
+        const bool ok = FetchUrl(url, &body) && a.ParseWeather(body);
+        if (!ok) ESP_LOGW(TAG, "No se pudo obtener el clima");
+        vTaskDelay(pdMS_TO_TICKS(ok ? 30 * 60 * 1000 : 20 * 1000));
+    }
+}
+
+bool Agenda::ParseWeather(const std::string& body) {
+    cJSON* root = cJSON_Parse(body.c_str());
+    if (!root) return false;
+    bool ok = false;
+
+    cJSON* cur = cJSON_GetObjectItem(root, "current");
+    cJSON* daily = cJSON_GetObjectItem(root, "daily");
+    cJSON* t = cur ? cJSON_GetObjectItem(cur, "temperature_2m") : nullptr;
+    cJSON* c = cur ? cJSON_GetObjectItem(cur, "weather_code") : nullptr;
+    cJSON* dt = daily ? cJSON_GetObjectItem(daily, "time") : nullptr;
+    cJSON* dc = daily ? cJSON_GetObjectItem(daily, "weather_code") : nullptr;
+    cJSON* dmax = daily ? cJSON_GetObjectItem(daily, "temperature_2m_max") : nullptr;
+    cJSON* dmin = daily ? cJSON_GetObjectItem(daily, "temperature_2m_min") : nullptr;
+
+    if (cJSON_IsNumber(t) && cJSON_IsNumber(c) && cJSON_IsArray(dt) && cJSON_IsArray(dc) &&
+        cJSON_IsArray(dmax) && cJSON_IsArray(dmin)) {
+        DisplayLockGuard lock(display_);
+        temp_c_ = (int)lround(t->valuedouble);
+        temp_ok_ = true;
+        weather_code_ = c->valueint;
+        int n = std::min(7, cJSON_GetArraySize(dt));
+        n = std::min(n, std::min(cJSON_GetArraySize(dc), std::min(cJSON_GetArraySize(dmax), cJSON_GetArraySize(dmin))));
+        for (int i = 0; i < n; i++) {
+            cJSON* d = cJSON_GetArrayItem(dt, i);
+            cJSON* code = cJSON_GetArrayItem(dc, i);
+            cJSON* mx = cJSON_GetArrayItem(dmax, i);
+            cJSON* mn = cJSON_GetArrayItem(dmin, i);
+            memset(&days_[i], 0, sizeof(Forecast));
+            if (cJSON_IsString(d) && d->valuestring) snprintf(days_[i].date, sizeof(days_[i].date), "%s", d->valuestring);
+            days_[i].code = cJSON_IsNumber(code) ? code->valueint : 0;
+            days_[i].tmax = cJSON_IsNumber(mx) ? (int)lround(mx->valuedouble) : 0;
+            days_[i].tmin = cJSON_IsNumber(mn) ? (int)lround(mn->valuedouble) : 0;
+        }
+        days_n_ = n;
+        weather_ok_ = true;
+        RefreshClock();
+        RefreshWeather();
+        ok = true;
+    }
+    cJSON_Delete(root);
+    return ok;
+}
+
+// Dibuja el icono del tiempo (cat: -1 sin datos, 0..6 segun WeatherCat)
+void Agenda::DrawWeatherIcon(int cat) {
+    if (!wicon_ || cat == wicon_cat_) return;
+    wicon_cat_ = cat;
+    lv_obj_clean(wicon_);
+
+    const lv_color_t cloud_col =
+        C(cat < 0 ? 0x5F7396 : cat == 5 ? 0x6B7A99 : cat == 3 ? 0x9AA9C6 : 0xDDE6FF);
+    auto draw_cloud = [&](int ox, int oy) {
+        Circle(wicon_, ox + 6, oy + 18, 24, cloud_col);
+        Circle(wicon_, ox + 22, oy + 6, 32, cloud_col);
+        Circle(wicon_, ox + 48, oy + 16, 26, cloud_col);
+        Box(wicon_, ox + 18, oy + 28, 52, 16, cloud_col, 8);
+    };
+    auto draw_sun = [&](int cx, int cy, int r) {
+        const lv_color_t y = C(0xFFD93D);
+        Circle(wicon_, cx - r, cy - r, 2 * r, y);
+        for (int i = 0; i < 8; i++) {
+            const float a = (float)i * 0.785398f;
+            Circle(wicon_, cx + (int)((float)(r + 9) * cosf(a)) - 2,
+                   cy + (int)((float)(r + 9) * sinf(a)) - 2, 5, y);
+        }
+    };
+
+    switch (cat) {
+        case 0:  // sol
+            draw_sun(45, 28, 13);
+            break;
+        case 1:  // poco nuboso
+            draw_sun(26, 20, 9);
+            draw_cloud(14, 8);
+            break;
+        case 3:  // lluvia
+            draw_cloud(6, 0);
+            for (int i = 0; i < 3; i++) Box(wicon_, 24 + i * 18, 48, 4, 10, C(0x4DA3FF), 2);
+            break;
+        case 4:  // nieve
+            draw_cloud(6, 0);
+            for (int i = 0; i < 3; i++) Circle(wicon_, 24 + i * 18, 50, 6, C(0xFFFFFF));
+            break;
+        case 5:  // tormenta
+            draw_cloud(6, 0);
+            Box(wicon_, 42, 44, 7, 9, C(0xFFD93D), 1);
+            Box(wicon_, 36, 50, 7, 9, C(0xFFD93D), 1);
+            break;
+        case 6:  // niebla
+            for (int i = 0; i < 3; i++) Box(wicon_, 8, 8 + i * 14, 74, 7, C(0x8FA3C8), 3);
+            break;
+        default:  // nublado o sin datos
+            draw_cloud(6, 4);
+            break;
+    }
+}
+
+void Agenda::RefreshWeather() {
+    DrawWeatherIcon(weather_ok_ ? WeatherCat(weather_code_) : -1);
+    if (!fc_title_) return;
+    char buf[96];
+    for (int i = 0; i < 7; i++) {
+        if (i < days_n_) {
+            int y = 0, m = 0, d = 0;
+            sscanf(days_[i].date, "%d-%d-%d", &y, &m, &d);
+            const int wd = (m >= 1 && m <= 12 && d >= 1) ? Weekday(y, m, d) : 0;
+            snprintf(buf, sizeof(buf), "%s %02d/%02d   %s   %d / %d C", kWdAbbr[wd], d, m,
+                     kWxNames[WeatherCat(days_[i].code)], days_[i].tmin, days_[i].tmax);
+            SetLabel(fc_lbl_[i], buf);
+            Show(fc_lbl_[i], true);
+        } else {
+            Show(fc_lbl_[i], false);
+        }
+    }
+    SetLabel(fc_title_, weather_ok_ ? "Prevision - El Puerto de Santa Maria"
+                                    : "Sin datos del clima todavia");
+}
+
 void Agenda::RefreshAfterChange() {
     RefreshCalendar();
     UpdateNext();
@@ -441,7 +650,6 @@ std::string Agenda::AddEventApi(int y, int m, int d, int h, int mi, const std::s
     size_t n = std::min<size_t>(text.size(), sizeof(e.text) - 1);
     while (n > 0 && n < text.size() && ((uint8_t)text[n] & 0xC0) == 0x80) n--;  // no cortar un caracter UTF-8
     memcpy(e.text, text.data(), n);
-    e.text[n] = '\0';
     if (e.text[0] == 0) snprintf(e.text, sizeof(e.text), "Cita");
 
     const bool past = time_ok_ && EvKey(y, m, d, h, mi) <= NowKey();
@@ -452,26 +660,10 @@ std::string Agenda::AddEventApi(int y, int m, int d, int h, int mi, const std::s
     SaveEvents();
     RefreshAfterChange();
 
-    std::string out = "OK: added ";
-    out += std::to_string(y);
-    out += "-";
-    out += (m < 10 ? "0" : "");
-    out += std::to_string(m);
-    out += "-";
-    out += (d < 10 ? "0" : "");
-    out += std::to_string(d);
-    out += " ";
-    out += (h < 10 ? "0" : "");
-    out += std::to_string(h);
-    out += ":";
-    out += (mi < 10 ? "0" : "");
-    out += std::to_string(mi);
-    out += " \"";
-    out += e.text;
-    out += "\"";
-    if (remind) out += " with sound reminder";
-    if (past) out += " (this time is already in the past, it will not ring)";
-    return out;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "OK: added %04d-%02d-%02d %02d:%02d \"%s\"%s%s", y, m, d, h, mi,
+             e.text, remind ? " with sound reminder" : "", past ? " (this time is already in the past, it will not ring)" : "");
+    return buf;
 }
 
 std::string Agenda::ListEventsApi(int y, int m, int d) {
@@ -682,12 +874,9 @@ void Agenda::BuildUI() {
     lv_obj_set_style_border_opa(deg, LV_OPA_COVER, 0);
     MakeLabel(root_, "C", 0xFFD93D, LV_ALIGN_TOP_LEFT, 410, 107 + kOy);
 
-    // Nube (icono del clima; en la siguiente etapa cambiara segun el tiempo)
-    const lv_color_t cloud = C(0x8FA3C8);
-    Circle(root_, 340, 150 + kOy + 18, 24, cloud);
-    Circle(root_, 356, 150 + kOy + 6, 32, cloud);
-    Circle(root_, 382, 150 + kOy + 16, 26, cloud);
-    Box(root_, 352, 150 + kOy + 28, 52, 16, cloud, 8);
+    // Icono del tiempo (cambia segun el clima de hoy)
+    wicon_ = Box(root_, 334, 150 + kOy, 90, 60, C(kBg), 0);
+    lv_obj_set_style_bg_opa(wicon_, LV_OPA_TRANSP, 0);
 
     date_lbl_ = MakeLabel(root_, "", 0xDDE6FF, LV_ALIGN_TOP_LEFT, 322, 206 + kOy, 116);
 
@@ -746,11 +935,14 @@ void Agenda::BuildUI() {
     }
     MakeButton(up_panel_, 140, 410, 200, 48, kPanel, 14, "VOLVER", 40, 0xFFFFFF);
 
-    // --- Panel de la prevision de la semana (aun sin datos) ---
+    // --- Panel de la prevision de la semana ---
     fc_panel_ = MakePanel(root_);
-    MakeLabel(fc_panel_, "Prevision de la semana", 0xFFFFFF, LV_ALIGN_TOP_MID, 0, 28, 380);
-    MakeLabel(fc_panel_, "Todavia no hay datos del clima.\nSe activara en la siguiente etapa.",
-              0x8FA3C8, LV_ALIGN_TOP_MID, 0, 180, 380);
+    fc_title_ = MakeLabel(fc_panel_, "", 0xFFFFFF, LV_ALIGN_TOP_MID, 0, 28, 400);
+    for (int i = 0; i < 7; i++) {
+        fc_lbl_[i] = MakeLabel(fc_panel_, "", 0xFFFFFF, LV_ALIGN_TOP_LEFT, 60, 72 + i * 44, 360);
+        lv_obj_set_style_text_align(fc_lbl_[i], LV_TEXT_ALIGN_LEFT, 0);
+        Show(fc_lbl_[i], false);
+    }
     MakeButton(fc_panel_, 140, 410, 200, 48, kPanel, 14, "VOLVER", 41, 0xFFFFFF);
 
     // --- Aviso a pantalla completa (encima de todo, tambien en otros modos) ---
@@ -775,6 +967,7 @@ void Agenda::RefreshAll() {
     UpdateNext();
     UpdateAvisos();
     UpdateStatusIcons();
+    RefreshWeather();
 }
 
 void Agenda::RefreshCalendar() {
