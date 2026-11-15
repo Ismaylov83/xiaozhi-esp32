@@ -53,6 +53,8 @@ private:
     void LoadSettings();
     void SaveSettings();
     void LoadStations();
+    bool LoadStationsFromFile(const char* path);
+    void BuildStationRows();
 
     bool MountSd();
     void ReadDir();
