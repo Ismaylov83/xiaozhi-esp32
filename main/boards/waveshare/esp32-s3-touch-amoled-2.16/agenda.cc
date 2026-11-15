@@ -1,3 +1,5 @@
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#pragma GCC diagnostic ignored "-Wformat-overflow"
 #include "agenda.h"
 #include "application.h"
 #include "display/display.h"
@@ -12,6 +14,7 @@
 #include <esp_http_client.h>
 #include <esp_log.h>
 #include <esp_netif_sntp.h>
+#include <esp_timer.h>
 #include <esp_wifi.h>
 #if __has_include(<esp_crt_bundle.h>)
 #include <esp_crt_bundle.h>
@@ -213,6 +216,11 @@ int WeatherCat(int code) {
 const char* kWxNames[7] = {"Despejado", "Poco nuboso", "Nublado", "Lluvia",
                            "Nieve",     "Tormenta",    "Niebla"};
 
+// La hora es de fiar cuando se sincronizo por internet (o ya paso un rato desde el arranque)
+bool TimeTrusted() {
+    return sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED || esp_timer_get_time() > 120LL * 1000000LL;
+}
+
 }  // namespace
 
 Agenda& Agenda::GetInstance() {
@@ -348,7 +356,7 @@ void Agenda::Tick() {
     ReadClock();
 
     // Los avisos funcionan aunque la agenda no este en pantalla
-    if (time_ok_) CheckAlarms();
+    if (time_ok_ && TimeTrusted()) CheckAlarms();
     AlarmTick();
 
     if (!visible_) return;
@@ -660,7 +668,7 @@ std::string Agenda::AddEventApi(int y, int m, int d, int h, int mi, const std::s
     SaveEvents();
     RefreshAfterChange();
 
-    char buf[128];
+    char buf[320];
     snprintf(buf, sizeof(buf), "OK: added %04d-%02d-%02d %02d:%02d \"%s\"%s%s", y, m, d, h, mi,
              e.text, remind ? " with sound reminder" : "", past ? " (this time is already in the past, it will not ring)" : "");
     return buf;
