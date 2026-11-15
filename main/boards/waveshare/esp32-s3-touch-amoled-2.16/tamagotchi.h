@@ -4,6 +4,8 @@
 
 #include <functional>
 #include <stdint.h>
+#include <string>
+#include <time.h>
 #include <utility>
 
 class Display;
@@ -29,6 +31,7 @@ public:
     void Tick();
     void HandleButton(int id);
     void OnRootTap();
+    void RegisterTools();
 
 private:
     Tamagotchi() = default;
@@ -57,6 +60,9 @@ private:
     void Die(int cause);
     void Step(uint32_t dt);
     void TryCatchUp();
+    bool ShouldSleep();
+    std::string DescribeStatus();
+    std::string DoVoiceAction(const std::string& action);
     void RaiseCall(uint8_t type);
     void UpdateCall();
     void AddMistake();
@@ -100,6 +106,8 @@ private:
     bool visible_ = false;
     bool notify_ = false;
     bool catchup_pending_ = false;
+    time_t sim_unix_ = 0;  // hora simulada mientras se recupera el tiempo apagado
+    bool sim_active_ = false;
     bool blink_ = false;
     bool game_active_ = false;
     bool game_awaiting_ = false;
