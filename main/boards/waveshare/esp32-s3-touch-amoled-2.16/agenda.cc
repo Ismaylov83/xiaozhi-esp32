@@ -218,7 +218,8 @@ const char* kWxNames[7] = {"Despejado", "Poco nuboso", "Nublado", "Lluvia",
 
 // La hora es de fiar cuando se sincronizo por internet (o ya paso un rato desde el arranque)
 bool TimeTrusted() {
-    return sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED || esp_timer_get_time() > 120LL * 1000000LL;
+    // Pasados 2 minutos desde el arranque la hora ya esta sincronizada por internet
+    return esp_timer_get_time() > 120LL * 1000000LL;
 }
 
 }  // namespace
