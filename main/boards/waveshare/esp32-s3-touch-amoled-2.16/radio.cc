@@ -69,10 +69,10 @@ struct DefaultStation {
 
 // Emisoras de serie (MP3 por http). Se pueden anadir mas desde la SD en la siguiente etapa.
 const DefaultStation kDefaultStations[] = {
-    {"Groove Salad", "ReggaeCity", "https://s9.voscast.com:7729/stream"},
-    {"Drone Zone", "ZonaRap Radio", "https://radio.zonarap.es/listen/zona_rap_radio/radio.mp3"},
-    {"Secret Agent", "AFN Rota", "http://playerservices.streamtheworld.com/pls/AFNE_RTA.pls"},
-    {"Lush", "KISS FM", "https://kissfm.kissfmradio.cires21.com/kissfm.mp3"},
+    {"Groove Salad", "Ambient", "http://ice1.somafm.com/groovesalad-128-mp3"},
+    {"Drone Zone", "Ambient", "http://ice1.somafm.com/dronezone-128-mp3"},
+    {"Secret Agent", "Lounge", "http://ice1.somafm.com/secretagent-128-mp3"},
+    {"Lush", "Chill", "http://ice1.somafm.com/lush-128-mp3"},
     {"Space Station", "Electronica", "http://ice1.somafm.com/spacestation-128-mp3"},
     {"Indie Pop Rocks", "Indie", "http://ice1.somafm.com/indiepop-128-mp3"},
     {"Defcon Radio", "Hacker", "http://ice1.somafm.com/defcon-128-mp3"},
@@ -329,13 +329,13 @@ public:
             return false;
         }
         cur_ = s;
-        if (xTaskCreate(DownloadEntry, "mp3_dl", 10240, new std::shared_ptr<Session>(s), 4,
+        if (xTaskCreate(DownloadEntry, "mp3_dl", 10240, new std::shared_ptr<Session>(s), 6,
                         nullptr) != pdPASS) {
             Stop();
             if (err) *err = "no se pudo crear la tarea de descarga";
             return false;
         }
-        if (xTaskCreate(DecodeEntry, "mp3_dec", 10240, new std::shared_ptr<Session>(s), 6,
+        if (xTaskCreate(DecodeEntry, "mp3_dec", 10240, new std::shared_ptr<Session>(s), 7,
                         nullptr) != pdPASS) {
             Stop();
             if (err) *err = "no se pudo crear la tarea de audio";
@@ -355,6 +355,8 @@ public:
 private:
     static constexpr size_t kRingSize = 96 * 1024;
     static constexpr int kInBuf = 8192;
+    static constexpr size_t kPrebuffer = 32 * 1024;  // espera esto antes de empezar a sonar
+    static constexpr size_t kRebuffer = 16 * 1024;   // y esto si se vacia a mitad
 
     struct Session {
         Mp3Stream* owner = nullptr;
@@ -449,13 +451,21 @@ private:
             int16_t last = 0;
             std::vector<int16_t> w, out;
 
+            auto filled = [&]() -> size_t { return kRingSize - xRingbufferGetCurFreeSize(s->ring); };
+            // Almacen previo: no empieza a sonar hasta tener unos segundos descargados
+            for (int k = 0; k < 150 && !s->abort && !s->done && filled() < kPrebuffer; k++) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+
             while (!s->abort) {
                 bool ring_empty = false;
+                bool had_item = false;
                 if (bytes_in < kInBuf - 2048) {  // hay hueco: rellenar desde el anillo
                     size_t got = 0;
                     void* item = xRingbufferReceiveUpTo(s->ring, &got, pdMS_TO_TICKS(s->done ? 10 : 100),
                                                         (size_t)(kInBuf - bytes_in));
                     if (item) {
+                        had_item = true;
                         memcpy(in + bytes_in, item, got);
                         bytes_in += (int)got;
                         vRingbufferReturnItem(s->ring, item);
@@ -464,7 +474,14 @@ private:
                     }
                 }
                 if (ring_empty && bytes_in < 4) break;      // todo reproducido
-                if (bytes_in < 1800 && !s->done) continue;  // falta un frame completo
+                if (bytes_in < 1800 && !s->done) {  // falta un frame completo
+                    if (started && !had_item) {     // se vacio el almacen: espera a que se llene un poco
+                        for (int k = 0; k < 100 && !s->abort && !s->done && filled() < kRebuffer; k++) {
+                            vTaskDelay(pdMS_TO_TICKS(100));
+                        }
+                    }
+                    continue;
+                }
 
                 uint8_t* rp = in;
                 int left = bytes_in;
@@ -614,7 +631,73 @@ void Radio::LoadStations() {
     for (const DefaultStation& s : kDefaultStations) {
         stations_.push_back({s.name, s.genre, s.url});
     }
+    // Si hay una tarjeta SD con radios.txt, sus emisoras sustituyen a las de serie
+    if (MountSd()) LoadStationsFromFile("/sdcard/radios.txt");
     if (selected_ < 0 || selected_ >= (int)stations_.size()) selected_ = 0;
+}
+
+// Lee un archivo con una emisora por linea:  Nombre|Genero|URL   (o solo  Nombre|URL)
+// Las lineas que empiezan por # se ignoran.
+bool Radio::LoadStationsFromFile(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+
+    auto trim = [](std::string s) {
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t'))
+            s.pop_back();
+        size_t i = 0;
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
+        return s.substr(i);
+    };
+
+    std::vector<Station> list;
+    char line[512];
+    bool first = true;
+    while (fgets(line, sizeof(line), f) && (int)list.size() < kMaxStations) {
+        std::string l = line;
+        if (first && l.compare(0, 3, "\xEF\xBB\xBF") == 0) l = l.substr(3);  // marca BOM
+        first = false;
+        l = trim(l);
+        if (l.empty() || l[0] == '#') continue;
+
+        std::vector<std::string> parts;
+        size_t start = 0;
+        while (true) {
+            const size_t bar = l.find('|', start);
+            if (bar == std::string::npos) {
+                parts.push_back(trim(l.substr(start)));
+                break;
+            }
+            parts.push_back(trim(l.substr(start, bar - start)));
+            start = bar + 1;
+        }
+        if (parts.size() < 2) continue;
+        Station st;
+        st.name = parts[0].substr(0, 60);
+        st.genre = parts.size() >= 3 ? parts[1].substr(0, 40) : "Radio";
+        st.url = parts.size() >= 3 ? parts[2] : parts[1];
+        if (st.name.empty() || st.url.compare(0, 4, "http") != 0 || st.url.size() > 290) continue;
+        list.push_back(st);
+    }
+    fclose(f);
+    if (list.empty()) return false;
+    stations_ = list;
+    ESP_LOGI(TAG, "Emisoras cargadas desde la SD: %u", (unsigned)stations_.size());
+    return true;
+}
+
+// (Re)dibuja las filas de la lista de emisoras
+void Radio::BuildStationRows() {
+    if (!list_) return;
+    lv_obj_clean(list_);
+    for (int i = 0; i < kMaxStations; i++) row_[i] = nullptr;
+    if (selected_ < 0 || selected_ >= (int)stations_.size()) selected_ = 0;
+    const int n = std::min((int)stations_.size(), kMaxStations);
+    for (int i = 0; i < n; i++) {
+        row_[i] = MakeRow(list_, 4, 4 + i * 58, 208, 54, i == selected_ ? kSelected : kListBg, 100 + i);
+        MakeLabel(row_[i], stations_[i].name.c_str(), 0xFFFFFF, LV_ALIGN_TOP_LEFT, 12, 8, 188, true);
+        MakeLabel(row_[i], stations_[i].genre.c_str(), 0x8FA3C8, LV_ALIGN_TOP_LEFT, 12, 30, 188, true);
+    }
 }
 
 void Radio::SetVisible(bool visible) {
@@ -697,6 +780,7 @@ void Radio::CmdTask(void*) {
         if (xQueueReceive((QueueHandle_t)r.cmd_q_, &c, portMAX_DELAY) != pdTRUE) continue;
         r.EnsurePlayer();
         if (c.type == 1) {
+            esp_wifi_set_ps(WIFI_PS_NONE);  // sin ahorro de energia: la conexion va mas estable
             std::string err;
             if (!Stream().Play(c.url, &err)) {
                 r.playing_ = false;
@@ -706,6 +790,7 @@ void Radio::CmdTask(void*) {
         } else {
             Stream().Stop();
             g_external_audio_active = false;
+            esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         }
     }
 }
@@ -906,6 +991,19 @@ void Radio::OnSdRow(int idx) {
                    [](unsigned char c) { return (char)tolower(c); });
     const bool is_mp3 = lower.size() > 4 && lower.compare(lower.size() - 4, 4, ".mp3") == 0;
 
+    if (lower == "radios.txt") {
+        char b2[120];
+        if (LoadStationsFromFile(full.c_str())) {
+            BuildStationRows();
+            snprintf(b2, sizeof(b2), "Emisoras cargadas: %d", (int)stations_.size());
+        } else {
+            snprintf(b2, sizeof(b2), "radios.txt vacio o mal escrito (Nombre|Genero|URL)");
+        }
+        sd_msg_ = b2;
+        SetLabel(sd_info_, sd_msg_.c_str());
+        return;
+    }
+
     char buf[200];
     if (is_mp3) {
         snprintf(buf, sizeof(buf), "Reproduciendo: %s", en.name.c_str());
@@ -1007,12 +1105,7 @@ void Radio::BuildUI() {
     // --- Columna derecha: emisoras ---
     list_ = Box(root_, 224, 66, 216, 322, C(kListBg), 12);
     MakeScrollable(list_);
-    const int n = std::min((int)stations_.size(), kMaxStations);
-    for (int i = 0; i < n; i++) {
-        row_[i] = MakeRow(list_, 4, 4 + i * 58, 208, 54, kListBg, 100 + i);
-        MakeLabel(row_[i], stations_[i].name.c_str(), 0xFFFFFF, LV_ALIGN_TOP_LEFT, 12, 8, 188, true);
-        MakeLabel(row_[i], stations_[i].genre.c_str(), 0x8FA3C8, LV_ALIGN_TOP_LEFT, 12, 30, 188, true);
-    }
+    BuildStationRows();
 
     // --- Panel del explorador de la SD ---
     sd_panel_ = Box(root_, 0, 0, kW, kH, C(kBg), 0);
