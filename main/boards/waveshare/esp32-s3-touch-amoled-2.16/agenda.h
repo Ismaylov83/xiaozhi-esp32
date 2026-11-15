@@ -70,6 +70,12 @@ private:
     std::string DeleteEventApi(int y, int m, int d, int h, int mi);
     void RefreshAfterChange();
 
+    // Clima y hora (El Puerto de Santa Maria)
+    static void WeatherTask(void* arg);
+    bool ParseWeather(const std::string& body);
+    void RefreshWeather();
+    void DrawWeatherIcon(int cat);
+
     // Interfaz
     void BuildUI();
     void MakeDigit(Digit& d, lv_obj_t* parent, int x, int y, int w, int h, int t, uint32_t on);
@@ -102,6 +108,17 @@ private:
     int view_y_ = 0, view_m_ = 0, sel_day_ = 0;
     int temp_c_ = 0;
     bool temp_ok_ = false;
+    struct Forecast {
+        int code;
+        int tmax;
+        int tmin;
+        char date[11];
+    };
+    Forecast days_[7] = {};
+    int days_n_ = 0;
+    bool weather_ok_ = false;
+    int weather_code_ = -1;
+    int wicon_cat_ = -2;
     uint32_t tick_count_ = 0;
 
     std::vector<Event> events_;
@@ -151,6 +168,9 @@ private:
     lv_obj_t* up_lbl_[kUpRows] = {};
 
     lv_obj_t* fc_panel_ = nullptr;
+    lv_obj_t* fc_title_ = nullptr;
+    lv_obj_t* fc_lbl_[7] = {};
+    lv_obj_t* wicon_ = nullptr;
 
     lv_obj_t* alarm_panel_ = nullptr;
     lv_obj_t* alarm_txt_ = nullptr;
