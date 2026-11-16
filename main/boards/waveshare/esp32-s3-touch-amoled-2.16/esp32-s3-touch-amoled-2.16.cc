@@ -14,6 +14,7 @@
 #include "tamagotchi.h"
 #include "agenda.h"
 #include "radio.h"
+#include "clock_app.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
