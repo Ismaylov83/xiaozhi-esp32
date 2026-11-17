@@ -1298,7 +1298,47 @@ void Radio::RefreshVolume() {
     SetLabel(vol_lbl_, buf);
     lv_obj_set_width(vol_fill_, std::max(2, (190 * volume_) / 100));
     lv_obj_set_style_bg_color(mute_btn_, C(muted_ ? 0xE53935 : 0x2EA8F0), 0);
+    g_gain = alarm_vol_ >= 0 ? (alarm_vol_ * 256) / 100 : (muted_ ? 0 : (volume_ * 256) / 100);
+}
+
+// ---------------------------------------------------------------------------
+// Para el despertador
+// ---------------------------------------------------------------------------
+
+bool Radio::SdReady() { return MountSd(); }
+
+void Radio::PlayForAlarm(const std::string& source, const std::string& title, bool is_file) {
+    DisplayLockGuard lock(display_);
+    resume_pending_ = false;
+    pending_start_ = false;
+    StartPlayback(source, title, is_file);
+}
+
+void Radio::StopForAlarm() {
+    DisplayLockGuard lock(display_);
+    resume_pending_ = false;
+    pending_start_ = false;
+    if (playing_) StopPlayback("Detenido");
+}
+
+void Radio::SetAlarmVolume(int percent) {
+    alarm_vol_ = std::max(0, std::min(100, percent));
+    g_gain = (alarm_vol_ * 256) / 100;
+}
+
+void Radio::ClearAlarmVolume() {
+    alarm_vol_ = -1;
     g_gain = muted_ ? 0 : (volume_ * 256) / 100;
+}
+
+int Radio::StationCount() { return (int)std::min<size_t>(stations_.size(), (size_t)kMaxStations); }
+
+std::string Radio::StationName(int i) {
+    return (i >= 0 && i < (int)stations_.size()) ? stations_[i].name : std::string();
+}
+
+std::string Radio::StationUrl(int i) {
+    return (i >= 0 && i < (int)stations_.size()) ? stations_[i].url : std::string();
 }
 
 void Radio::RefreshNow() {
