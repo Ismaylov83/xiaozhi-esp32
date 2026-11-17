@@ -25,6 +25,8 @@ public:
     void SetActivityCallback(std::function<void()> cb) { on_activity_ = std::move(cb); }
     // Se llama cuando un toque debe sacar del reposo automatico
     void SetExitCallback(std::function<void()> cb) { on_exit_ = std::move(cb); }
+    // Se llama cada segundo (la placa lo usa para decidir cuando pasar al reposo)
+    void SetTickCallback(std::function<void()> cb) { on_tick_ = std::move(cb); }
 
     // Internos: los llaman los eventos de LVGL.
     void Tick();
@@ -87,6 +89,7 @@ private:
     Display* display_ = nullptr;
     std::function<void()> on_activity_;
     std::function<void()> on_exit_;
+    std::function<void()> on_tick_;
 
     bool visible_ = false;
     bool auto_standby_ = false;
