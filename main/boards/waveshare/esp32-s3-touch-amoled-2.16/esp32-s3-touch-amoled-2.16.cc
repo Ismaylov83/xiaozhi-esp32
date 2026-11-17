@@ -17,6 +17,7 @@
 #include "clock_app.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
@@ -168,7 +169,8 @@ private:
     Pmic* pmic_ = nullptr;
     Button boot_button_;
     Button mode_button_;
-    int mode_ = 0;  // 0 asistente, 1 mascota, 2 agenda, 3 radio
+    int mode_ = 0;  // 0 asistente, 1 mascota, 2 agenda, 3 radio, 4 reloj
+    int64_t last_activity_us_ = 0;
     CustomLcdDisplay* display_;
     CustomBacklight* backlight_;
     esp_io_expander_handle_t io_expander = NULL;
@@ -186,7 +188,8 @@ private:
             // En modo mascota o agenda la placa no se apaga sola
             if (!Tamagotchi::GetInstance().IsVisible() && !Agenda::GetInstance().IsVisible() &&
                 !Agenda::GetInstance().HasPendingReminders() &&
-                !Radio::GetInstance().IsVisible() && !Radio::GetInstance().IsPlaying()) {
+                !Radio::GetInstance().IsVisible() && !Radio::GetInstance().IsPlaying() &&
+                !ClockApp::GetInstance().ShouldStayOn()) {
                 pmic_->PowerOff();
             } });
         power_save_timer_->SetEnabled(true);
@@ -256,23 +259,65 @@ private:
         });
     }
 
-    // Asistente -> mascota -> agenda -> radio -> asistente...
+    // Cualquier toque o pulsacion: despierta la pantalla y reinicia la cuenta del reposo
+    void Touched() {
+        last_activity_us_ = esp_timer_get_time();
+        power_save_timer_->WakeUp();
+    }
+
+    // Asistente -> mascota -> agenda -> radio -> reloj -> asistente...
     void CycleMode() {
         auto& pet = Tamagotchi::GetInstance();
         auto& agenda = Agenda::GetInstance();
-        mode_ = (mode_ + 1) % 4;
+        mode_ = (mode_ + 1) % 5;
         if (pet.IsVisible() != (mode_ == 1)) {
             pet.Toggle();
         }
         agenda.SetVisible(mode_ == 2);
         Radio::GetInstance().SetVisible(mode_ == 3);
-        power_save_timer_->WakeUp();
+        ClockApp::GetInstance().SetVisible(mode_ == 4, false);
+        Touched();
+    }
+
+    // Tras 90 s sin tocar nada (y con el asistente en reposo) aparece el reloj
+    void StandbyCheck() {
+        if (mode_ != 0) return;
+        if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
+            last_activity_us_ = esp_timer_get_time();  // el asistente esta hablando o escuchando
+            return;
+        }
+        if (esp_timer_get_time() - last_activity_us_ > 90LL * 1000000LL) {
+            mode_ = 4;
+            ClockApp::GetInstance().SetVisible(true, true);
+        }
+    }
+
+    // Un toque en el reposo automatico (o el asistente al hablar) vuelve al asistente
+    void ExitStandby() {
+        if (mode_ != 4) return;
+        mode_ = 0;
+        last_activity_us_ = esp_timer_get_time();
+        ClockApp::GetInstance().SetVisible(false, false);
+    }
+
+    void InitializeClock() {
+        auto& clock = ClockApp::GetInstance();
+        clock.SetActivityCallback([this]() {
+            Touched();
+        });
+        clock.SetExitCallback([this]() {
+            ExitStandby();
+        });
+        clock.SetTickCallback([this]() {
+            StandbyCheck();
+        });
+        clock.Init(display_);
     }
 
     void InitializeRadio() {
         auto& radio = Radio::GetInstance();
         radio.SetActivityCallback([this]() {
-            power_save_timer_->WakeUp();
+            Touched();
         });
         radio.SetBatteryProvider([this](int& level, bool& charging) {
             bool discharging = false;
@@ -284,7 +329,7 @@ private:
     void InitializeAgenda() {
         auto& agenda = Agenda::GetInstance();
         agenda.SetActivityCallback([this]() {
-            power_save_timer_->WakeUp();
+            Touched();
         });
         agenda.SetBatteryProvider([this](int& level, bool& charging) {
             bool discharging = false;
@@ -296,7 +341,7 @@ private:
     void InitializeTamagotchi() {
         auto& pet = Tamagotchi::GetInstance();
         pet.SetActivityCallback([this]() {
-            power_save_timer_->WakeUp();
+            Touched();
         });
         pet.Init(display_);
     }
@@ -402,6 +447,7 @@ public:
         InitializeTamagotchi();
         InitializeAgenda();
         InitializeRadio();
+        InitializeClock();
         InitializeTools();
     }
 
