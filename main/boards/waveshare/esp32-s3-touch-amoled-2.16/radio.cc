@@ -73,6 +73,11 @@ struct DefaultStation {
 
 // Emisoras de serie (MP3 por http). Se pueden anadir mas desde la SD en la siguiente etapa.
 const DefaultStation kDefaultStations[] = {
+    {"Tripplestar Radio", "Reggae", "https://servidor24.brlogic.com:7178/live"},
+    {"Zona Rap Radio", "Hip Hop en Español", "https://radio.zonarap.es/listen/zona_rap_radio/radio.mp3"},
+    {"Gozadera Fm", "La Autentica Radio del Reggaeton", "https://streaming.shoutcast.com/gozadera"},
+    {"Los 40 Jerez", "La radio de los éxitos", "https://playerservices.streamtheworld.com/api/livestream-redirect/LOS40_ASO_JEREZ.mp3"},
+    {"Afro Radio", "Where rhythm meets soul", "https://live.afro.radio/listen/afroradio/radio.mp3"},
     {"Groove Salad", "Ambient", "http://ice1.somafm.com/groovesalad-128-mp3"},
     {"Drone Zone", "Ambient", "http://ice1.somafm.com/dronezone-128-mp3"},
     {"Secret Agent", "Lounge", "http://ice1.somafm.com/secretagent-128-mp3"},
@@ -81,11 +86,6 @@ const DefaultStation kDefaultStations[] = {
     {"Indie Pop Rocks", "Indie", "http://ice1.somafm.com/indiepop-128-mp3"},
     {"Defcon Radio", "Hacker", "http://ice1.somafm.com/defcon-128-mp3"},
     {"Radio Paradise", "Eclectic", "http://stream.radioparadise.com/mp3-128"},
-    {"Tripplestar Radio", "Reggae", "https://servidor24.brlogic.com:7178/live"},
-    {"Zona Rap Radio", "Hip Hop en Español", "https://radio.zonarap.es/listen/zona_rap_radio/radio.mp3"},
-    {"Gozadera Fm", "La Autentica Radio del Reggaeton", "https://streaming.shoutcast.com/gozadera"},
-    {"Los 40 Jerez", "La radio de los éxitos", "https://playerservices.streamtheworld.com/api/livestream-redirect/LOS40_ASO_JEREZ.mp3"},
-    {"Afro Radio", "Where rhythm meets soul", "https://live.afro.radio/listen/afroradio/radio.mp3"},
 };
 
 lv_color_t C(uint32_t hex) { return lv_color_hex(hex); }
