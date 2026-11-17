@@ -11,34 +11,49 @@
 
 class Display;
 
-class Agenda {
+class Radio {
 public:
-    static Agenda& GetInstance();
+    static Radio& GetInstance();
 
     // Llamar una vez, despues de crear la pantalla y el tactil.
     void Init(Display* display);
     void SetVisible(bool visible);
     bool IsVisible() const { return visible_; }
-    // true si hay algun recordatorio por sonar (la placa no debe apagarse sola)
-    bool HasPendingReminders() const { return pending_reminders_.load(); }
-    // Se llama cada vez que el usuario toca algo o suena un aviso (despierta la pantalla).
+    // true mientras suena una emisora o un archivo (la placa no debe apagarse sola)
+    bool IsPlaying() const { return playing_; }
     void SetActivityCallback(std::function<void()> cb) { on_activity_ = std::move(cb); }
     // Devuelve el nivel de bateria (0-100) y si esta cargando.
     void SetBatteryProvider(std::function<bool(int&, bool&)> cb) { battery_cb_ = std::move(cb); }
-    // Para la siguiente etapa (temperatura por internet).
-    void SetTemperature(int celsius, bool valid);
 
     // Internos: los llaman los eventos de LVGL.
     void Tick();
     void HandleButton(int id);
+    void RebuildSdList();
+    void BarsTick();
+    void RegisterTools();
+
+    // Para el despertador
+    bool SdReady();  // monta la tarjeta SD si hace falta
+    void PlayForAlarm(const std::string& source, const std::string& title, bool is_file);
+    void StopForAlarm();
+    void SetAlarmVolume(int percent);  // volumen propio de la alarma (0-100)
+    void ClearAlarmVolume();
+    int StationCount();
+    std::string StationName(int i);
+    std::string StationUrl(int i);
 
 private:
-    Agenda() = default;
+    static void CmdTask(void* arg);
+    Radio() = default;
 
-    struct Event {
-        uint16_t year;
-        uint8_t month, day, hour, minute, remind, fired;
-        char text[40];
+    struct Station {
+        std::string name;
+        std::string genre;
+        std::string url;
+    };
+    struct SdEntry {
+        std::string name;
+        bool dir;
     };
     struct Digit {
         lv_obj_t* seg[7];
@@ -46,133 +61,92 @@ private:
     };
 
     void Activity();
-    void LoadEvents();
-    void SaveEvents();
-    void SortEvents();
-    void ReadClock();
-    bool HasEvents(int y, int m, int d) const;
-    int NowKey() const;
+    void LoadSettings();
+    void SaveSettings();
+    void LoadStations();
+    bool LoadStationsFromFile(const char* path);
+    void BuildStationRows();
 
-    // Avisos
-    void CheckAlarms();
-    void StartAlarm(const Event& e);
-    void DismissAlarm();
-    void AlarmTick();
-    void Beep();
-    void UpdateAvisos();
+    bool MountSd();
+    void ReadDir();
+    void OpenSd();
+    void OnSdRow(int idx);
+
+    void BuildUI();
+    void SelectStation(int idx);
+    void RefreshAll();
+    void RefreshVolume();
+    void RefreshNow();
+    void RefreshClock();
     void UpdateStatusIcons();
 
-    // Herramientas para que xiaozhi use la agenda por voz
-    void RegisterTools();
-    std::string AddEventApi(int y, int m, int d, int h, int mi, const std::string& text,
-                            bool remind);
-    std::string ListEventsApi(int y, int m, int d);
-    std::string DeleteEventApi(int y, int m, int d, int h, int mi);
-    void RefreshAfterChange();
+    // Reproduccion
+    void EnsurePlayer();
+    void SendCmd(int type, const std::string& url = "", const std::string& title = "");
+    void StartPlayback(const std::string& source, const std::string& title, bool is_file);
+    void StartStation();
+    std::string VoiceStatus();
+    std::string VoiceList();
+    std::string VoicePlay(const std::string& station);
+    std::string VoiceStop();
+    std::string VoiceVolume(int volume);
+    std::string VoiceMute(bool mute);
+    void StopPlayback(const char* status);
+    void SetStatus(const char* text);
 
-    // Clima y hora (El Puerto de Santa Maria)
-    static void WeatherTask(void* arg);
-    bool ParseWeather(const std::string& body);
-    void RefreshWeather();
-    void DrawWeatherIcon(int cat);
-
-    // Interfaz
-    void BuildUI();
-    void MakeDigit(Digit& d, lv_obj_t* parent, int x, int y, int w, int h, int t, uint32_t on);
-    void SetDigit(Digit& d, int v);
-    void RefreshAll();
-    void RefreshCalendar();
-    void RefreshClock();
-    void UpdateNext();
-    void OpenDay(int day);
-    void RefreshDayPanel();
-    void OpenEditor();
-    void UpdateEditLabels();
-    void UpdateEditText();
-    void TypeKey(int id);
-    void SaveEvent();
-    void DeleteEvent(int idx);
-    void OpenUpcoming();
-    void CloseAllPanels();
-
-    static constexpr int kMaxRows = 6;
-    static constexpr int kUpRows = 7;
+    static constexpr int kMaxStations = 40;
+    static constexpr int kMaxSdEntries = 200;
 
     Display* display_ = nullptr;
     std::function<void()> on_activity_;
     std::function<bool(int&, bool&)> battery_cb_;
 
     bool visible_ = false;
-    bool time_ok_ = false;
-    int today_y_ = 0, today_m_ = 0, today_d_ = 0, hour_ = -1, min_ = -1;
-    int view_y_ = 0, view_m_ = 0, sel_day_ = 0;
-    int temp_c_ = 0;
-    bool temp_ok_ = false;
-    struct Forecast {
-        int code;
-        int tmax;
-        int tmin;
-        char date[11];
-    };
-    Forecast days_[7] = {};
-    int days_n_ = 0;
-    bool weather_ok_ = false;
-    int weather_code_ = -1;
-    int wicon_cat_ = -2;
+    std::atomic<bool> playing_{false};
+    bool pending_start_ = false;  // orden de voz: empezar cuando el asistente termine
+    bool resume_pending_ = false;  // se pauso por hablar con el asistente: volver a sonar
+    int idle_ticks_ = 0;
+    bool is_file_ = false;
+    bool player_ready_ = false;
+    int retries_ = 0;
+    int reconnect_in_ = 0;
+    std::string cur_source_;
+    std::string cur_title_;
+    std::string status_;
+    void* cmd_q_ = nullptr;
+    int bar_h_[16] = {};
+    bool muted_ = false;
+    int volume_ = 70;
+    int alarm_vol_ = -1;  // volumen propio de la alarma (-1 = ninguno)
+    int selected_ = 0;
+    int hour_ = -1, min_ = -1;
     uint32_t tick_count_ = 0;
 
-    std::vector<Event> events_;
-    std::atomic<bool> pending_reminders_{false};
-    int day_idx_[kMaxRows] = {};
-    int day_count_ = 0;
-    int edit_h_ = 9, edit_m_ = 0;
-    bool edit_remind_ = true;
-    int edit_len_ = 0;
-    char edit_text_[40] = {0};
+    std::vector<Station> stations_;
 
-    bool alarm_active_ = false;
-    int alarm_secs_ = 0;
+    bool sd_mounted_ = false;
+    void* sd_card_ = nullptr;
+    std::string sd_path_;
+    std::vector<SdEntry> sd_entries_;
+    std::string sd_msg_;
 
-    // Widgets: pantalla principal
+    // Widgets
     lv_obj_t* root_ = nullptr;
-    lv_obj_t* title_ = nullptr;
-    lv_obj_t* cell_[42] = {};
-    lv_obj_t* cell_lbl_[42] = {};
-    lv_obj_t* cell_dot_[42] = {};
-    Digit clk_[4] = {};
-    Digit temp_[3] = {};
-    lv_obj_t* colon_[2] = {};
-    lv_obj_t* date_lbl_ = nullptr;
-    lv_obj_t* next_lbl_ = nullptr;
-    lv_obj_t* avisos_btn_ = nullptr;
     lv_obj_t* wifi_bar_[4] = {};
     lv_obj_t* bat_fill_ = nullptr;
     lv_obj_t* bat_lbl_ = nullptr;
+    Digit clk_[4] = {};
+    lv_obj_t* mute_btn_ = nullptr;
+    lv_obj_t* np_name_ = nullptr;
+    lv_obj_t* np_status_ = nullptr;
+    lv_obj_t* bars_[16] = {};
+    lv_obj_t* vol_lbl_ = nullptr;
+    lv_obj_t* vol_fill_ = nullptr;
+    lv_obj_t* list_ = nullptr;
+    lv_obj_t* row_[kMaxStations] = {};
 
-    // Paneles
-    lv_obj_t* day_panel_ = nullptr;
-    lv_obj_t* day_title_ = nullptr;
-    lv_obj_t* day_empty_ = nullptr;
-    lv_obj_t* row_[kMaxRows] = {};
-    lv_obj_t* row_lbl_[kMaxRows] = {};
-
-    lv_obj_t* edit_panel_ = nullptr;
-    lv_obj_t* edit_title_ = nullptr;
-    lv_obj_t* edit_h_lbl_ = nullptr;
-    lv_obj_t* edit_m_lbl_ = nullptr;
-    lv_obj_t* edit_remind_btn_ = nullptr;
-    lv_obj_t* edit_txt_lbl_ = nullptr;
-
-    lv_obj_t* up_panel_ = nullptr;
-    lv_obj_t* up_title_ = nullptr;
-    lv_obj_t* up_lbl_[kUpRows] = {};
-
-    lv_obj_t* fc_panel_ = nullptr;
-    lv_obj_t* fc_title_ = nullptr;
-    lv_obj_t* fc_lbl_[7] = {};
-    lv_obj_t* wicon_ = nullptr;
-
-    lv_obj_t* alarm_panel_ = nullptr;
-    lv_obj_t* alarm_txt_ = nullptr;
-    Digit alarm_clk_[4] = {};
+    lv_obj_t* sd_panel_ = nullptr;
+    lv_obj_t* sd_title_ = nullptr;
+    lv_obj_t* sd_info_ = nullptr;
+    lv_obj_t* sd_list_ = nullptr;
 };
