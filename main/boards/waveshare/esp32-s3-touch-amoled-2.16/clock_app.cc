@@ -299,6 +299,7 @@ void ClockApp::SetVisible(bool visible, bool auto_standby) {
 
 void ClockApp::Tick() {
     if (!root_) return;
+    if (on_tick_) on_tick_();
     ReadTime();
     CheckAlarms();
     if (ringing_) RingTick();
