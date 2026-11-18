@@ -32,6 +32,16 @@ public:
     void BarsTick();
     void RegisterTools();
 
+    // Para el despertador
+    bool SdReady();  // monta la tarjeta SD si hace falta
+    void PlayForAlarm(const std::string& source, const std::string& title, bool is_file);
+    void StopForAlarm();
+    void SetAlarmVolume(int percent);  // volumen propio de la alarma (0-100)
+    void ClearAlarmVolume();
+    int StationCount();
+    std::string StationName(int i);
+    std::string StationUrl(int i);
+
 private:
     static void CmdTask(void* arg);
     Radio() = default;
@@ -107,6 +117,7 @@ private:
     int bar_h_[16] = {};
     bool muted_ = false;
     int volume_ = 70;
+    int alarm_vol_ = -1;  // volumen propio de la alarma (-1 = ninguno)
     int selected_ = 0;
     int hour_ = -1, min_ = -1;
     uint32_t tick_count_ = 0;
